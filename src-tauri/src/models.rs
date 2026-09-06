@@ -23,6 +23,14 @@ pub enum RuntimePhase {
     Error,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ControllerPhase {
+    Idle,
+    Starting,
+    Running,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReactiveConfig {
@@ -106,6 +114,48 @@ impl RuntimeSnapshot {
     pub fn set_signal(&mut self, level: f32, bar_count: u8) {
         self.level = level.clamp(0.0, 1.0);
         self.bar_count = bar_count.min(8);
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControllerSnapshot {
+    pub phase: ControllerPhase,
+    pub port_name: Option<String>,
+    pub injected_count: u32,
+    pub bad_frames: u32,
+    pub message: String,
+}
+
+impl ControllerSnapshot {
+    pub fn idle() -> Self {
+        Self {
+            phase: ControllerPhase::Idle,
+            port_name: None,
+            injected_count: 0,
+            bad_frames: 0,
+            message: "Codex 控制器未启动".to_owned(),
+        }
+    }
+
+    pub fn starting(port_name: &str) -> Self {
+        Self {
+            phase: ControllerPhase::Starting,
+            port_name: Some(port_name.to_owned()),
+            injected_count: 0,
+            bad_frames: 0,
+            message: "正在连接设备…".to_owned(),
+        }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            phase: ControllerPhase::Idle,
+            port_name: None,
+            injected_count: 0,
+            bad_frames: 0,
+            message: message.into(),
+        }
     }
 }
 

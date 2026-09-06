@@ -35,3 +35,32 @@ export const getReactiveState = () => invoke<RuntimeSnapshot>("get_reactive_stat
 
 export const subscribeReactiveState = (onState: (state: RuntimeSnapshot) => void): Promise<UnlistenFn> =>
   listen<RuntimeSnapshot>("reactive-state", (event) => onState(event.payload));
+
+export interface ControllerSnapshot {
+  phase: ControllerPhase;
+  portName: string | null;
+  injectedCount: number;
+  badFrames: number;
+  message: string;
+}
+
+export interface ControllerKeyEvent {
+  board: string;
+  action: string;
+  injected: string | null;
+  ok: boolean;
+  injectedCount: number;
+  badFrames: number;
+}
+
+export type ControllerPhase = "idle" | "starting" | "running";
+
+export const startController = (portName: string) => invoke<void>("start_controller", { portName });
+export const stopController = () => invoke<void>("stop_controller");
+export const getControllerState = () => invoke<ControllerSnapshot>("get_controller_state");
+
+export const subscribeControllerState = (onState: (state: ControllerSnapshot) => void): Promise<UnlistenFn> =>
+  listen<ControllerSnapshot>("controller-state", (event) => onState(event.payload));
+
+export const subscribeControllerKey = (onKey: (event: ControllerKeyEvent) => void): Promise<UnlistenFn> =>
+  listen<ControllerKeyEvent>("controller-key", (event) => onKey(event.payload));

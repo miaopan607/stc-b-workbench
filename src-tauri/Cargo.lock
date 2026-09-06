@@ -2975,6 +2975,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "wasapi",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
