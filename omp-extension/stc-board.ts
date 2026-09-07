@@ -1,0 +1,422 @@
+// STC-B 学习板 → oh-my-pi 原生控制器扩展
+//
+// 板载 5 向摇杆 + K1/K2/K3 经串口(115200 8N1)发送 6 字节按键帧
+// [AA 5A 21 key action chk]，本扩展在进程内读取串口并注入 omp TUI：
+//   摇杆上/下 → ↑/↓        弹窗、斜杠菜单里移动（长按连发）
+//   摇杆中键/K3 → Enter    确认
+//   摇杆左 → Esc           关闭弹窗/取消
+//   摇杆右 → /             打开斜杠菜单
+//   K1 → 原生中断当前回合 (ctx.abort)
+//   K2 → Tab               补全/切换
+//
+// 按键走 tui.injectDebugInput（与真实键盘同一管线），不依赖窗口焦点、
+// 不经过系统键盘模拟，无中文输入法干扰。
+//
+// 命令: /board          断开/连接（多串口时弹出选择）
+//       /board COM5     连接指定串口
+//
+// 安装: 复制本文件到 ~/.omp/agent/extensions/stc-board.ts（或项目 .omp/extensions/）
+// 仅依赖 bun:ffi + node 内置模块，无需 npm install。
+import { dlopen, FFIType, ptr } from "bun:ffi";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+
+// ---------------------------------------------------------------------------
+// 协议
+// ---------------------------------------------------------------------------
+
+const FRAME_TYPE_KEY = 0x21;
+const FRAME_LEN = 6;
+const ACT_PRESS = 1;
+const ACT_REPEAT = 2;
+const ACT_RELEASE = 3;
+
+const KEY_UP = 1;
+const KEY_DOWN = 2;
+const KEY_LEFT = 3;
+const KEY_RIGHT = 4;
+const KEY_CENTER = 5;
+const KEY_K1 = 6;
+const KEY_K2 = 7;
+const KEY_K3 = 8;
+
+const KEY_NAMES: Record<number, string> = {
+	[KEY_UP]: "↑",
+	[KEY_DOWN]: "↓",
+	[KEY_LEFT]: "Esc",
+	[KEY_RIGHT]: "/",
+	[KEY_CENTER]: "Enter",
+	[KEY_K1]: "中断",
+	[KEY_K2]: "Tab",
+	[KEY_K3]: "Enter",
+};
+
+// 板键 → 注入的终端序列（与真实键盘同一管线）
+const KEY_SEQUENCES: Record<number, string> = {
+	[KEY_UP]: "\x1b[A",
+	[KEY_DOWN]: "\x1b[B",
+	[KEY_LEFT]: "\x1b",
+	[KEY_RIGHT]: "/",
+	[KEY_CENTER]: "\r",
+	[KEY_K2]: "\t",
+	[KEY_K3]: "\r",
+};
+
+class KeyFrameParser {
+	buf = Buffer.alloc(0);
+	badFrames = 0;
+
+	feed(data: Uint8Array): Array<{ key: number; action: number }> {
+		this.buf = Buffer.concat([this.buf, data]);
+		const events: Array<{ key: number; action: number }> = [];
+		for (;;) {
+			const head = this.buf.indexOf(Buffer.from([0xaa, 0x5a]));
+			if (head < 0) {
+				if (this.buf.length > 1) this.buf = this.buf.subarray(this.buf.length - 1);
+				break;
+			}
+			if (head > 0) this.buf = this.buf.subarray(head);
+			if (this.buf.length < FRAME_LEN) break;
+			const frame = this.buf.subarray(0, FRAME_LEN);
+			this.buf = this.buf.subarray(FRAME_LEN);
+			const key = frame[3];
+			const action = frame[4];
+			if (frame[2] === FRAME_TYPE_KEY && key >= 1 && key <= KEY_K3 && action >= ACT_PRESS && action <= ACT_RELEASE && frame[5] === (FRAME_TYPE_KEY ^ key ^ action)) {
+				events.push({ key, action });
+			} else {
+				this.badFrames++;
+			}
+		}
+		return events;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Win32 串口（bun:ffi）
+// ---------------------------------------------------------------------------
+
+const GENERIC_READ_WRITE = 0xc0000000;
+const OPEN_EXISTING = 3;
+const INVALID_HANDLE = 0xffffffffffffffffn;
+const PURGE_TXCLEAR = 0x4;
+const PURGE_RXCLEAR = 0x8;
+
+function loadKernel32() {
+	return dlopen("kernel32.dll", {
+		QueryDosDeviceW: { args: [FFIType.ptr, FFIType.ptr, FFIType.u32], returns: FFIType.u32 },
+		CreateFileW: {
+			args: [FFIType.ptr, FFIType.u32, FFIType.u32, FFIType.ptr, FFIType.u32, FFIType.u32, FFIType.ptr],
+			returns: FFIType.ptr,
+		},
+		CloseHandle: { args: [FFIType.ptr], returns: FFIType.i32 },
+		SetCommState: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+		SetCommTimeouts: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+		ReadFile: { args: [FFIType.ptr, FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+		PurgeComm: { args: [FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
+		GetLastError: { args: [], returns: FFIType.u32 },
+	});
+}
+
+function listComPorts(): string[] {
+	const k = loadKernel32();
+	const buf = new Uint16Array(65536);
+	const n = k.symbols.QueryDosDeviceW(null, ptr(buf), buf.length);
+	if (n > 0) {
+		const names = Buffer.from(buf.buffer, 0, n * 2).toString("utf16le");
+		return names
+			.split("\0")
+			.filter((name) => /^COM\d+$/.test(name))
+			.sort((a, b) => Number(a.slice(3)) - Number(b.slice(3)));
+	}
+	// 枚举失败时退回直接探测
+	const found: string[] = [];
+	for (let i = 1; i <= 32; i++) {
+		const opened = tryOpen(`COM${i}`);
+		if (opened) {
+			found.push(`COM${i}`);
+			closePort(opened);
+		}
+	}
+	return found;
+}
+
+// DCB：115200 8N1，fBinary，DTR 不动（避免打扰 STC 自动下载电路）
+function makeDCB(): Uint8Array {
+	const dcb = new Uint8Array(28);
+	const view = new DataView(dcb.buffer);
+	view.setUint32(0, 28, true);
+	view.setUint32(4, 115200, true);
+	view.setUint32(8, 0x1, true);
+	view.setUint8(18, 8);
+	view.setUint8(19, 0);
+	view.setUint8(20, 0);
+	return dcb;
+}
+
+// COMMTIMEOUTS：ReadFile 立即返回（轮询模式）
+function makeTimeouts(): Uint8Array {
+	const timeouts = new Uint8Array(20);
+	const view = new DataView(timeouts.buffer);
+	view.setUint32(0, 0xffffffff, true);
+	return timeouts;
+}
+
+interface OpenPort {
+	name: string;
+	handle: bigint;
+	rx: Uint8Array;
+	rxCount: Uint32Array;
+	parser: KeyFrameParser;
+}
+
+function tryOpen(name: string): OpenPort | null {
+	const k = loadKernel32();
+	const path = Buffer.from(`\\\\.\\${name}\0`, "utf16le");
+	const handle = k.symbols.CreateFileW(ptr(path), GENERIC_READ_WRITE, 0, null, OPEN_EXISTING, 0, null);
+	if (handle === INVALID_HANDLE) return null;
+	const okState = k.symbols.SetCommState(handle, ptr(makeDCB()));
+	const okTimeouts = k.symbols.SetCommTimeouts(handle, ptr(makeTimeouts()));
+	if (!okState || !okTimeouts) {
+		k.symbols.CloseHandle(handle);
+		return null;
+	}
+	k.symbols.PurgeComm(handle, PURGE_TXCLEAR | PURGE_RXCLEAR);
+	return { name, handle, rx: new Uint8Array(256), rxCount: new Uint32Array(1), parser: new KeyFrameParser() };
+}
+
+function closePort(port: OpenPort) {
+	loadKernel32().symbols.CloseHandle(port.handle);
+}
+
+// ---------------------------------------------------------------------------
+// 扩展主体
+// ---------------------------------------------------------------------------
+
+interface TuiLike {
+	injectDebugInput(data: string): void;
+	requestRender(force?: boolean): void;
+}
+
+export default function stcBoard(pi: ExtensionAPI) {
+	pi.setLabel("STC-B Board Controller");
+
+	let sessionCtx: ExtensionContext | null = null;
+	let tui: TuiLike | null = null;
+	let port: OpenPort | null = null;
+	let reconnectName: string | null = null;
+	let lastError = "";
+	let reconnectAt = 0;
+	let injectedCount = 0;
+	let lastKey = "—";
+	let pollTimer: unknown = null;
+	let shuttingDown = false;
+
+	// --- 状态展示（状态栏 chip + 编辑器下方 widget）---
+
+	function statusChip(): string {
+		if (port) return `板:${port.name}`;
+		if (lastError) return "板:未连接⚠";
+		return "板:—";
+	}
+
+	function setStatus(text?: string) {
+		try {
+			sessionCtx?.ui.setStatus("stc-board", text ?? statusChip());
+		} catch {
+			// 会话切换期间 ui 可能不可用
+		}
+	}
+
+	function widgetLine(): string {
+		const state = port ? port.name : "未连接";
+		const bad = port?.parser.badFrames ?? 0;
+		const line = `STC-B ${state} · 最近 ${lastKey} · 注入 ${injectedCount} · 坏帧 ${bad}`;
+		return lastError ? `${line} · ${lastError}` : line;
+	}
+
+	function refreshWidget() {
+		try {
+			tui?.requestRender();
+		} catch {
+			// ignore
+		}
+	}
+
+	// --- 连接管理 ---
+
+	function disconnect() {
+		if (port) {
+			closePort(port);
+			port = null;
+		}
+		lastError = "";
+		setStatus();
+		refreshWidget();
+	}
+
+	function connect(name: string): boolean {
+		disconnect();
+		const opened = tryOpen(name);
+		if (!opened) {
+			lastError = `${name} 打开失败/被占用`;
+			reconnectAt = Date.now() + 2000;
+			setStatus();
+			refreshWidget();
+			return false;
+		}
+		port = opened;
+		lastError = "";
+		lastKey = "—";
+		injectedCount = 0;
+		setStatus();
+		refreshWidget();
+		return true;
+	}
+
+	// --- 按键处理 ---
+
+	function handleKey(key: number, action: number) {
+		if (action === ACT_RELEASE) return;
+		const name = KEY_NAMES[key] ?? `key${key}`;
+		lastKey = name;
+		if (key === KEY_K1) {
+			// 原生中断当前回合，不走 Ctrl+C 模拟
+			void sessionCtx?.abort();
+		} else {
+			const sequence = KEY_SEQUENCES[key];
+			if (sequence && tui) {
+				tui.injectDebugInput(sequence);
+				injectedCount++;
+			}
+		}
+		setStatus(`板:${port?.name ?? "—"} · ${name}${action === ACT_REPEAT ? " (长按)" : ""}`);
+		refreshWidget();
+	}
+
+	// --- 串口轮询（30ms，错误被托管定时器隔离）---
+
+	function poll() {
+		if (shuttingDown) return;
+		if (!port) {
+			if (reconnectAt && Date.now() >= reconnectAt) {
+				reconnectAt = 0;
+				if (reconnectName) connect(reconnectName);
+			}
+			return;
+		}
+		const k = loadKernel32();
+		port.rxCount[0] = 0;
+		const ok = k.symbols.ReadFile(port.handle, ptr(port.rx), port.rx.length, ptr(port.rxCount), null);
+		if (!ok) {
+			lastError = "串口读取失败";
+			closePort(port);
+			port = null;
+			reconnectAt = Date.now() + 2000;
+			setStatus();
+			refreshWidget();
+			return;
+		}
+		const n = port.rxCount[0];
+		if (n > 0) {
+			for (const { key, action } of port.parser.feed(port.rx.subarray(0, n))) {
+				handleKey(key, action);
+			}
+		}
+	}
+
+	// --- 命令 ---
+
+	pi.registerCommand("board", {
+		description: "STC-B 板控制器：连接/断开摇杆串口（/board COM5 指定串口）",
+		handler: async (args) => {
+			const target = args.trim();
+			if (!target) {
+				if (port) {
+					reconnectName = null;
+					disconnect();
+					sessionCtx?.ui.notify("STC-B 控制器已断开", "info");
+					return;
+				}
+				const ports = listComPorts();
+				if (ports.length === 0) {
+					sessionCtx?.ui.notify("未发现串口：请确认板子已插 USB", "warning");
+					return;
+				}
+				if (ports.length === 1) {
+					reconnectName = ports[0];
+					if (connect(ports[0])) {
+						sessionCtx?.ui.notify(`STC-B 控制器已连接 ${ports[0]}：摇杆上/下移动 · 中键确认 · 左键 Esc · 右键 / · K1 中断 · K2 Tab`, "info");
+					} else {
+						sessionCtx?.ui.notify(lastError, "error");
+					}
+					return;
+				}
+				const picked = await sessionCtx?.ui.select("选择 STC-B 串口", ports.map((name) => ({ label: name })));
+				if (picked) {
+					reconnectName = picked;
+					if (connect(picked)) {
+						sessionCtx?.ui.notify(`STC-B 控制器已连接 ${picked}`, "info");
+					} else {
+						sessionCtx?.ui.notify(lastError, "error");
+					}
+				}
+				return;
+			}
+			reconnectName = target.toUpperCase();
+			if (connect(reconnectName)) {
+				sessionCtx?.ui.notify(`STC-B 控制器已连接 ${reconnectName}`, "info");
+			} else {
+				sessionCtx?.ui.notify(lastError, "error");
+			}
+		},
+	});
+
+	// --- 生命周期 ---
+
+	pi.on("session_start", async (_event, ctx) => {
+		sessionCtx = ctx;
+		shuttingDown = false;
+		if (pollTimer) {
+			ctx.clearTimer(pollTimer);
+			pollTimer = null;
+		}
+		// widget 只注册一次；组件每次渲染读取最新状态
+		try {
+			ctx.ui.setWidget("stc-board", (boundTui: TuiLike) => {
+				tui = boundTui;
+				return {
+					render(width: number) {
+						return [widgetLine().slice(0, Math.max(1, width))];
+					},
+				};
+			}, { placement: "belowEditor" });
+		} catch {
+			// 无 UI 模式（print/RPC）下忽略
+		}
+		setStatus();
+		pollTimer = ctx.setInterval(poll, 30);
+		if (!port && reconnectName) {
+			connect(reconnectName);
+		} else if (!port && !reconnectName) {
+			// 恰好一个串口时静默自动连接
+			const ports = listComPorts();
+			if (ports.length === 1) {
+				reconnectName = ports[0];
+				connect(ports[0]);
+			}
+		}
+	});
+
+	pi.on("session_shutdown", () => {
+		shuttingDown = true;
+		if (pollTimer) {
+			sessionCtx?.clearTimer(pollTimer);
+			pollTimer = null;
+		}
+		if (port) {
+			closePort(port);
+			port = null;
+		}
+		sessionCtx = null;
+		tui = null;
+	});
+}
