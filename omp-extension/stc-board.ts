@@ -10,7 +10,8 @@
 //   K2 → Tab               补全/切换
 //
 // 按键走 tui.injectDebugInput（与真实键盘同一管线），不依赖窗口焦点、
-// 不经过系统键盘模拟，无中文输入法干扰。
+// 不经过系统键盘模拟，无中文输入法干扰。连接状态显示在原生状态栏
+// （板:COMx / 板:未连接），不占用额外行。
 //
 // 命令: /board          断开/连接（多串口时弹出选择）
 //       /board COM5     连接指定串口
@@ -205,17 +206,13 @@ export default function stcBoard(pi: ExtensionAPI) {
 	let reconnectName: string | null = null;
 	let lastError = "";
 	let reconnectAt = 0;
-	let injectedCount = 0;
-	let lastKey = "—";
 	let pollTimer: unknown = null;
 	let shuttingDown = false;
 
-	// --- 状态展示（状态栏 chip + 编辑器下方 widget）---
+	// --- 状态展示（仅原生状态栏 chip，不占额外行）---
 
 	function statusChip(): string {
-		if (port) return `板:${port.name}`;
-		if (lastError) return "板:未连接⚠";
-		return "板:—";
+		return port ? `板:${port.name}` : "板:未连接";
 	}
 
 	function setStatus(text?: string) {
@@ -223,21 +220,6 @@ export default function stcBoard(pi: ExtensionAPI) {
 			sessionCtx?.ui.setStatus("stc-board", text ?? statusChip());
 		} catch {
 			// 会话切换期间 ui 可能不可用
-		}
-	}
-
-	function widgetLine(): string {
-		const state = port ? port.name : "未连接";
-		const bad = port?.parser.badFrames ?? 0;
-		const line = `STC-B ${state} · 最近 ${lastKey} · 注入 ${injectedCount} · 坏帧 ${bad}`;
-		return lastError ? `${line} · ${lastError}` : line;
-	}
-
-	function refreshWidget() {
-		try {
-			tui?.requestRender();
-		} catch {
-			// ignore
 		}
 	}
 
@@ -250,7 +232,6 @@ export default function stcBoard(pi: ExtensionAPI) {
 		}
 		lastError = "";
 		setStatus();
-		refreshWidget();
 	}
 
 	function connect(name: string): boolean {
@@ -260,15 +241,11 @@ export default function stcBoard(pi: ExtensionAPI) {
 			lastError = `${name} 打开失败/被占用`;
 			reconnectAt = Date.now() + 2000;
 			setStatus();
-			refreshWidget();
 			return false;
 		}
 		port = opened;
 		lastError = "";
-		lastKey = "—";
-		injectedCount = 0;
 		setStatus();
-		refreshWidget();
 		return true;
 	}
 
@@ -276,20 +253,15 @@ export default function stcBoard(pi: ExtensionAPI) {
 
 	function handleKey(key: number, action: number) {
 		if (action === ACT_RELEASE) return;
-		const name = KEY_NAMES[key] ?? `key${key}`;
-		lastKey = name;
 		if (key === KEY_K1) {
 			// 原生中断当前回合，不走 Ctrl+C 模拟
 			void sessionCtx?.abort();
-		} else {
-			const sequence = KEY_SEQUENCES[key];
-			if (sequence && tui) {
-				tui.injectDebugInput(sequence);
-				injectedCount++;
-			}
+			return;
 		}
-		setStatus(`板:${port?.name ?? "—"} · ${name}${action === ACT_REPEAT ? " (长按)" : ""}`);
-		refreshWidget();
+		const sequence = KEY_SEQUENCES[key];
+		if (sequence && tui) {
+			tui.injectDebugInput(sequence);
+		}
 	}
 
 	// --- 串口轮询（30ms，错误被托管定时器隔离）---
@@ -312,7 +284,6 @@ export default function stcBoard(pi: ExtensionAPI) {
 			port = null;
 			reconnectAt = Date.now() + 2000;
 			setStatus();
-			refreshWidget();
 			return;
 		}
 		const n = port.rxCount[0];
@@ -379,13 +350,14 @@ export default function stcBoard(pi: ExtensionAPI) {
 			ctx.clearTimer(pollTimer);
 			pollTimer = null;
 		}
-		// widget 只注册一次；组件每次渲染读取最新状态
+		// 零行渲染的隐形 widget：仅用于捕获 TUI 实例（injectDebugInput 需要），
+		// belowEditor 容器不会为它添加任何行
 		try {
 			ctx.ui.setWidget("stc-board", (boundTui: TuiLike) => {
 				tui = boundTui;
 				return {
-					render(width: number) {
-						return [widgetLine().slice(0, Math.max(1, width))];
+					render() {
+						return [];
 					},
 				};
 			}, { placement: "belowEditor" });

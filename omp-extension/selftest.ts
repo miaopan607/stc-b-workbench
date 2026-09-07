@@ -71,22 +71,34 @@ const ctxMock = {
 await handlers.session_start({}, ctxMock);
 check("session_start 注册了轮询定时器", timers.length === 1);
 check("widget 已注册", widgetComponent !== null);
-const line = widgetComponent!.render(120)[0];
-check("widget 渲染包含状态", line.includes("STC-B") && line.includes("未连接"), line);
+const rendered = widgetComponent!.render(120);
+check("widget 零行渲染（不占额外行）", rendered.length === 0, `行数=${rendered.length}`);
+const chip = statusCalls.at(-1)?.[1] ?? "";
+check("状态栏显示板状态（板:COMx 或 板:未连接）", /^板:(COM\d+|未连接)$/.test(chip), chip);
 
-// 无板子时轮询不应崩溃（当前机器无串口，port 为 null）
-timers[0]!.fn();
-check("空轮询不崩溃", true);
+// 无板子时轮询不应崩溃（port 为 null）
+if (!/^板:COM\d+$/.test(chip)) {
+	timers[0]!.fn();
+	check("空轮询不崩溃", true);
+}
 
-// /board 无串口 → 提示未发现串口
-await commands.board.handler("");
-check("/board 无串口提示", notifications.some((n) => n.includes("未发现串口")), notifications.join(" | "));
+// /board 无参数：已连接 → 断开；未连接 → 提示未发现串口
+if (/^板:COM\d+$/.test(chip)) {
+	await commands.board.handler("");
+	check("/board 断开已连接的板", notifications.some((n) => n.includes("已断开")), notifications.join(" | "));
+	check("断开后状态栏显示未连接", (statusCalls.at(-1)?.[1] ?? "").includes("板:未连接"), statusCalls.at(-1)?.[1] ?? "");
+	// 重新连回去，模拟断开重插后的自动重连路径
+	await commands.board.handler(statusCalls.findLast(([, text]) => /^板:COM\d+$/.test(text))?.[1]?.slice(2) ?? "");
+} else {
+	await commands.board.handler("");
+	check("/board 无串口提示", notifications.some((n) => n.includes("未发现串口")), notifications.join(" | "));
+}
 
-// 指定不存在的串口 → 连接失败提示 + 自动重连挂起
+// 指定不存在的串口 → 连接失败提示 + 状态栏仍未连接
 await commands.board.handler("COM95");
 check("/board COM95 失败提示", notifications.some((n) => n.includes("COM95")), notifications.join(" | "));
-const chip = statusCalls.at(-1)?.[1] ?? "";
-check("状态栏显示未连接", chip.includes("未连接") || chip.includes("板:"), chip);
+const chipAfterFail = statusCalls.at(-1)?.[1] ?? "";
+check("失败后状态栏显示未连接", chipAfterFail.includes("板:未连接"), chipAfterFail);
 
 await handlers.session_shutdown({}, ctxMock);
 check("session_shutdown 清理定时器", timers.every((t) => t.cleared));
