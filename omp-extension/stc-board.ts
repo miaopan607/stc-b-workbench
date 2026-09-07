@@ -3,11 +3,12 @@
 // 板载 5 向摇杆 + K1/K2/K3 经串口(115200 8N1)发送 6 字节按键帧
 // [AA 5A 21 key action chk]，本扩展在进程内读取串口并注入 omp TUI：
 //   摇杆上/下 → ↑/↓        弹窗、斜杠菜单里移动（长按连发）
-//   摇杆中键/K3 → Enter    确认
-//   摇杆左 → Esc           关闭弹窗/取消
+//   摇杆中键 → Enter       确认
+//   摇杆左 → Backspace     删除字符/回退
 //   摇杆右 → /             打开斜杠菜单
 //   K1 → 原生中断当前回合 (ctx.abort)
 //   K2 → Tab               补全/切换
+//   K3 → Esc               关闭弹窗/取消
 //
 // 按键走 tui.injectDebugInput（与真实键盘同一管线），不依赖窗口焦点、
 // 不经过系统键盘模拟，无中文输入法干扰。连接状态显示在原生状态栏
@@ -40,26 +41,15 @@ const KEY_K1 = 6;
 const KEY_K2 = 7;
 const KEY_K3 = 8;
 
-const KEY_NAMES: Record<number, string> = {
-	[KEY_UP]: "↑",
-	[KEY_DOWN]: "↓",
-	[KEY_LEFT]: "Esc",
-	[KEY_RIGHT]: "/",
-	[KEY_CENTER]: "Enter",
-	[KEY_K1]: "中断",
-	[KEY_K2]: "Tab",
-	[KEY_K3]: "Enter",
-};
-
 // 板键 → 注入的终端序列（与真实键盘同一管线）
 const KEY_SEQUENCES: Record<number, string> = {
 	[KEY_UP]: "\x1b[A",
 	[KEY_DOWN]: "\x1b[B",
-	[KEY_LEFT]: "\x1b",
+	[KEY_LEFT]: "\x7f",
 	[KEY_RIGHT]: "/",
 	[KEY_CENTER]: "\r",
 	[KEY_K2]: "\t",
-	[KEY_K3]: "\r",
+	[KEY_K3]: "\x1b",
 };
 
 class KeyFrameParser {

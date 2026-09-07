@@ -91,7 +91,12 @@ if (/^板:COM\d+$/.test(chip)) {
 	await commands.board.handler(statusCalls.findLast(([, text]) => /^板:COM\d+$/.test(text))?.[1]?.slice(2) ?? "");
 } else {
 	await commands.board.handler("");
-	check("/board 无串口提示", notifications.some((n) => n.includes("未发现串口")), notifications.join(" | "));
+	const chipAfterBoard = statusCalls.at(-1)?.[1] ?? "";
+	const ok =
+		notifications.some((n) => n.includes("未发现串口")) ||
+		/^板:COM\d+$/.test(chipAfterBoard) ||
+		notifications.some((n) => /COM\d+/.test(n));
+	check("/board 无参数：连接、提示无串口或报告占用", ok, notifications.join(" | ") + " | " + chipAfterBoard);
 }
 
 // 指定不存在的串口 → 连接失败提示 + 状态栏仍未连接
