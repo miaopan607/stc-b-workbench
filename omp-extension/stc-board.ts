@@ -14,6 +14,12 @@
 // 不经过系统键盘模拟，无中文输入法干扰。连接状态显示在原生状态栏
 // （板:COMx / 板:未连接），不占用额外行。
 //
+// 工作状态回显：agent_start/agent_end 时向板子发送 6 字节状态帧
+// [AA 5A 22 status 0 chk]（status 1=工作中 0=空闲），板子收到后数码管
+// 显示 run+第8位转圈动画（工作中）或 Stop（空闲），8 颗 LED 做 Knight
+// Rider 来回扫描（参考 opencode 左下角动画的全亮度近似）。动画在板上
+// 本地运行，PC 只发状态变化。
+//
 // 命令: /board          断开/连接（多串口时弹出选择）
 //       /board COM5     连接指定串口
 //
@@ -27,6 +33,7 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 // ---------------------------------------------------------------------------
 
 const FRAME_TYPE_KEY = 0x21;
+const FRAME_TYPE_STATUS = 0x22;
 const FRAME_LEN = 6;
 const ACT_PRESS = 1;
 const ACT_REPEAT = 2;
@@ -51,6 +58,11 @@ const KEY_SEQUENCES: Record<number, string> = {
 	[KEY_K2]: "\t",
 	[KEY_K3]: "\x1b",
 };
+
+// 状态帧布局与音乐帧一致：字节3为保留0，字节4为负载（固件按 [3]==0 && [4]<=1 校验）
+export function statusFrame(status: number): Uint8Array {
+	return Uint8Array.from([0xaa, 0x5a, FRAME_TYPE_STATUS, 0, status, FRAME_TYPE_STATUS ^ status]);
+}
 
 class KeyFrameParser {
 	buf = Buffer.alloc(0);
@@ -102,6 +114,7 @@ function loadKernel32() {
 		SetCommState: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
 		SetCommTimeouts: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
 		ReadFile: { args: [FFIType.ptr, FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+		WriteFile: { args: [FFIType.ptr, FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
 		PurgeComm: { args: [FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
 		GetLastError: { args: [], returns: FFIType.u32 },
 	});
@@ -156,6 +169,7 @@ interface OpenPort {
 	handle: bigint;
 	rx: Uint8Array;
 	rxCount: Uint32Array;
+	txCount: Uint32Array;
 	parser: KeyFrameParser;
 }
 
@@ -171,7 +185,7 @@ function tryOpen(name: string): OpenPort | null {
 		return null;
 	}
 	k.symbols.PurgeComm(handle, PURGE_TXCLEAR | PURGE_RXCLEAR);
-	return { name, handle, rx: new Uint8Array(256), rxCount: new Uint32Array(1), parser: new KeyFrameParser() };
+	return { name, handle, rx: new Uint8Array(256), rxCount: new Uint32Array(1), txCount: new Uint32Array(1), parser: new KeyFrameParser() };
 }
 
 function closePort(port: OpenPort) {
@@ -198,6 +212,7 @@ export default function stcBoard(pi: ExtensionAPI) {
 	let reconnectAt = 0;
 	let pollTimer: unknown = null;
 	let shuttingDown = false;
+	let working = false;
 
 	// --- 状态展示（仅原生状态栏 chip，不占额外行）---
 
@@ -235,8 +250,21 @@ export default function stcBoard(pi: ExtensionAPI) {
 		}
 		port = opened;
 		lastError = "";
+		sendStatus();
 		setStatus();
 		return true;
+	}
+
+	// --- 工作状态上报（[AA 5A 22 0 status chk]）---
+
+	function sendStatus() {
+		if (!port) return;
+		const frame = statusFrame(working ? 1 : 0);
+		try {
+			loadKernel32().symbols.WriteFile(port.handle, ptr(frame), frame.length, ptr(port.txCount), null);
+		} catch {
+			// 写失败不致命，等下次状态变化或重连再同步
+		}
 	}
 
 	// --- 按键处理 ---
@@ -305,7 +333,7 @@ export default function stcBoard(pi: ExtensionAPI) {
 				if (ports.length === 1) {
 					reconnectName = ports[0];
 					if (connect(ports[0])) {
-						sessionCtx?.ui.notify(`STC-B 控制器已连接 ${ports[0]}：摇杆上/下移动 · 中键确认 · 左键 Esc · 右键 / · K1 中断 · K2 Tab`, "info");
+						sessionCtx?.ui.notify(`STC-B 控制器已连接 ${ports[0]}：摇杆上/下移动 · 中键确认 · 左键 Backspace · 右键 / · K1 中断 · K2 Tab · K3 Esc`, "info");
 					} else {
 						sessionCtx?.ui.notify(lastError, "error");
 					}
@@ -329,6 +357,21 @@ export default function stcBoard(pi: ExtensionAPI) {
 				sessionCtx?.ui.notify(lastError, "error");
 			}
 		},
+	});
+
+	// --- 工作状态（agent 循环启停时同步到板子）---
+
+	pi.on("agent_start", () => {
+		working = true;
+		sendStatus();
+	});
+
+	pi.on("agent_end", (event) => {
+		// willContinue：自动续跑（重试等）马上会再次 agent_start，保持工作中显示
+		if (!(event as { willContinue?: boolean }).willContinue) {
+			working = false;
+			sendStatus();
+		}
 	});
 
 	// --- 生命周期 ---
@@ -373,6 +416,10 @@ export default function stcBoard(pi: ExtensionAPI) {
 		if (pollTimer) {
 			sessionCtx?.clearTimer(pollTimer);
 			pollTimer = null;
+		}
+		if (port && working) {
+			working = false;
+			sendStatus();
 		}
 		if (port) {
 			closePort(port);

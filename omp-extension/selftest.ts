@@ -3,6 +3,13 @@
 import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
 
 const factory = (await import("./stc-board.ts")).default as ExtensionFactory;
+const { statusFrame } = (await import("./stc-board.ts")) as { statusFrame: (status: number) => Uint8Array };
+
+// 状态帧布局：字节3=保留0，字节4=状态，字节5=chk(0x22^status)
+const runningFrame = statusFrame(1);
+const stoppedFrame = statusFrame(0);
+check("状态帧 running 布局", runningFrame[0] === 0xaa && runningFrame[1] === 0x5a && runningFrame[2] === 0x22 && runningFrame[3] === 0 && runningFrame[4] === 1 && runningFrame[5] === 0x23, Array.from(runningFrame).join(" "));
+check("状态帧 stop 布局", stoppedFrame[4] === 0 && stoppedFrame[5] === 0x22, Array.from(stoppedFrame).join(" "));
 
 let failures = 0;
 function check(name: string, ok: boolean, detail = "") {
@@ -71,6 +78,13 @@ const ctxMock = {
 await handlers.session_start({}, ctxMock);
 check("session_start 注册了轮询定时器", timers.length === 1);
 check("widget 已注册", widgetComponent !== null);
+check("agent_start/agent_end 已注册", Boolean(handlers.agent_start && handlers.agent_end));
+
+// 工作状态事件（无串口时只更新内部状态，不应崩溃）
+await handlers.agent_start({}, ctxMock);
+await handlers.agent_end({ willContinue: true }, ctxMock);
+await handlers.agent_end({}, ctxMock);
+check("agent 状态事件不崩溃（无串口）", true);
 const rendered = widgetComponent!.render(120);
 check("widget 零行渲染（不占额外行）", rendered.length === 0, `行数=${rendered.length}`);
 const chip = statusCalls.at(-1)?.[1] ?? "";
