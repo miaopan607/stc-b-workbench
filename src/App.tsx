@@ -63,11 +63,11 @@ const SOURCE_LABELS: Record<AudioSource, string> = {
 const KEY_MAPPINGS: { board: string; inject: string; usage: string }[] = [
   { board: "摇杆上 / 下", inject: "↑ / ↓", usage: "弹窗与斜杠菜单移动选项，长按连发" },
   { board: "摇杆中键", inject: "Enter", usage: "确认执行" },
-  { board: "摇杆左", inject: "Esc", usage: "关闭弹窗 / 取消" },
+  { board: "摇杆左", inject: "Backspace", usage: "删除字符 / 回退" },
   { board: "摇杆右", inject: "/", usage: "打开斜杠菜单" },
   { board: "K1", inject: "Ctrl+C", usage: "中断当前回合" },
   { board: "K2", inject: "Tab", usage: "补全 / 排队提示" },
-  { board: "K3", inject: "Enter", usage: "备用确认键" },
+  { board: "K3", inject: "Esc", usage: "关闭弹窗 / 取消" },
 ];
 
 function App() {

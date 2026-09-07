@@ -119,11 +119,12 @@ fn inject_key(key: u8) -> Option<(&'static str, fn() -> bool)> {
     match key {
         KEY_UP => Some(("↑", || inject::tap(0x48, true))),
         KEY_DOWN => Some(("↓", || inject::tap(0x50, true))),
-        KEY_LEFT => Some(("Esc", || inject::tap(0x01, false))),
+        KEY_LEFT => Some(("Backspace", || inject::tap(0x0E, false))),
         KEY_RIGHT => Some(("/", || inject::tap_char('/'))),
-        KEY_CENTER | KEY_K3 => Some(("Enter", || inject::tap(0x1C, false))),
+        KEY_CENTER => Some(("Enter", || inject::tap(0x1C, false))),
         KEY_K1 => Some(("Ctrl+C", inject::ctrl_c)),
         KEY_K2 => Some(("Tab", || inject::tap(0x0F, false))),
+        KEY_K3 => Some(("Esc", || inject::tap(0x01, false))),
         _ => None,
     }
 }
