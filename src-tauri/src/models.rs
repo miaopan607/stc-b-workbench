@@ -31,6 +31,15 @@ pub enum ControllerPhase {
     Running,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ControllerProfile {
+    /// 摇杆/按键注入键盘事件，操控 codex 终端
+    Codex,
+    /// K1/K2/K3 注入系统媒体键（下一曲/播放暂停/上一曲）
+    Media,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReactiveConfig {
@@ -121,6 +130,7 @@ impl RuntimeSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct ControllerSnapshot {
     pub phase: ControllerPhase,
+    pub profile: ControllerProfile,
     pub port_name: Option<String>,
     pub injected_count: u32,
     pub bad_frames: u32,
@@ -131,16 +141,18 @@ impl ControllerSnapshot {
     pub fn idle() -> Self {
         Self {
             phase: ControllerPhase::Idle,
+            profile: ControllerProfile::Codex,
             port_name: None,
             injected_count: 0,
             bad_frames: 0,
-            message: "Codex 控制器未启动".to_owned(),
+            message: "控制器未启动".to_owned(),
         }
     }
 
-    pub fn starting(port_name: &str) -> Self {
+    pub fn starting(port_name: &str, profile: ControllerProfile) -> Self {
         Self {
             phase: ControllerPhase::Starting,
+            profile,
             port_name: Some(port_name.to_owned()),
             injected_count: 0,
             bad_frames: 0,
@@ -151,6 +163,7 @@ impl ControllerSnapshot {
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             phase: ControllerPhase::Idle,
+            profile: ControllerProfile::Codex,
             port_name: None,
             injected_count: 0,
             bad_frames: 0,

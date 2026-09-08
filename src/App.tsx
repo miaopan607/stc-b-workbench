@@ -20,6 +20,7 @@ import {
   type AudioSource,
   type ControllerKeyEvent,
   type ControllerPhase,
+  type ControllerProfile,
   type ControllerSnapshot,
   type DetectionMode,
   type ReactiveConfig,
@@ -29,7 +30,7 @@ import {
 } from "./lib/tauri";
 import "./styles.css";
 
-type AppMode = "music" | "controller";
+type AppMode = "music" | "controller" | "media";
 
 interface KeyLogEntry {
   id: number;
@@ -49,10 +50,11 @@ const DEFAULT_SNAPSHOT: RuntimeSnapshot = {
 
 const DEFAULT_CONTROLLER_SNAPSHOT: ControllerSnapshot = {
   phase: "idle",
+  profile: "codex",
   portName: null,
   injectedCount: 0,
   badFrames: 0,
-  message: "Codex 控制器未启动",
+  message: "控制器未启动",
 };
 
 const SOURCE_LABELS: Record<AudioSource, string> = {
@@ -69,6 +71,29 @@ const KEY_MAPPINGS: { board: string; inject: string; usage: string }[] = [
   { board: "K2", inject: "Tab", usage: "补全 / 排队提示" },
   { board: "K3", inject: "Esc", usage: "关闭弹窗 / 取消" },
 ];
+
+const MEDIA_KEY_MAPPINGS: { board: string; inject: string; usage: string }[] = [
+  { board: "K1", inject: "下一曲", usage: "系统媒体键：切换到下一首" },
+  { board: "K2", inject: "播放/暂停", usage: "系统媒体键：播放或暂停当前音乐" },
+  { board: "K3", inject: "上一曲", usage: "系统媒体键：切换到上一首" },
+];
+
+const MODE_LABELS: Record<Exclude<AppMode, "music">, { title: string; kicker: string; heading: [string, string]; description: string; warning: string }> = {
+  controller: {
+    title: "Codex 控制器",
+    kicker: "PHYSICAL CONTROLLER / CODEX CLI",
+    heading: ["让板子", "替你按键"],
+    description: "通过 USB 串口接收板载摇杆与按键，注入真实键盘事件操控 codex 终端。",
+    warning: "注入目标是当前聚焦窗口：使用时请保持 codex 终端在前台；音乐律动与控制器共用串口，二者同时只能运行一个。",
+  },
+  media: {
+    title: "媒体控制",
+    kicker: "PHYSICAL CONTROLLER / MEDIA KEYS",
+    heading: ["让板子", "控制音乐"],
+    description: "通过 USB 串口接收板载按键，注入系统媒体键控制正在播放的音乐软件。",
+    warning: "媒体键为系统级按键，无需窗口聚焦即可控制音乐播放；音乐律动与控制器共用串口，二者同时只能运行一个。",
+  },
+};
 
 function App() {
   const [mode, setMode] = useState<AppMode>("music");
@@ -189,16 +214,17 @@ function App() {
 
   async function toggleController() {
     setNotice("");
+    const profile: ControllerProfile = mode === "media" ? "media" : "codex";
     try {
       if (controllerRunning) {
         await stopController();
         setControllerSnapshot(DEFAULT_CONTROLLER_SNAPSHOT);
         setKeyLog([]);
       } else {
-        await startController(portName);
+        await startController(portName, profile);
       }
     } catch (error) {
-      setNotice(formatError(error, "无法启动 Codex 控制器"));
+      setNotice(formatError(error, "无法启动控制器"));
     }
   }
 
@@ -209,7 +235,7 @@ function App() {
           <span className="brand-mark" aria-hidden="true">STC</span>
           <div>
             <p className="eyebrow">STC-B / USB AUDIO LINK</p>
-            <h1>{mode === "music" ? "音乐律动" : "Codex 控制器"}</h1>
+            <h1>{mode === "music" ? "音乐律动" : MODE_LABELS[mode].title}</h1>
           </div>
         </div>
         <div className="topbar-actions">
@@ -227,6 +253,13 @@ function App() {
               onClick={() => setMode("controller")}
             >
               Codex 控制器
+            </button>
+            <button
+              type="button"
+              className={mode === "media" ? "mode-tab active" : "mode-tab"}
+              onClick={() => setMode("media")}
+            >
+              媒体控制
             </button>
           </nav>
           <span className={`status-badge ${activeSnapshot.phase}`} aria-live="polite">
@@ -250,7 +283,7 @@ function App() {
             <div className="preview-copy">
               <p className="section-kicker">LIVE SIGNAL / 8-SEGMENT DISPLAY</p>
               <h2 id="preview-title">让节拍<br /><em>看得见</em></h2>
-              <p className="hero-description">实时捕捉系统声音或麦克风输入，将音量转换成板载数码管的连续律动。</p>
+              <p className="hero-description">实时捕捉系统声音或麦克风输入，将音量转换成板载数码管的连续律动。律动同时，板载 K1/K2/K3 可直接控制上一曲 / 播放暂停 / 下一曲。</p>
               <div className="signal-readout" aria-live="polite">
                 <strong>{snapshot.barCount}</strong>
                 <span>/ 8 格<br />实时音量</span>
@@ -353,10 +386,10 @@ function App() {
         <main className="content">
           <section className="hero-grid" aria-labelledby="controller-title">
             <div className="preview-copy">
-              <p className="section-kicker">PHYSICAL CONTROLLER / CODEX CLI</p>
-              <h2 id="controller-title">让板子<br /><em>替你按键</em></h2>
-              <p className="hero-description">通过 USB 串口接收板载摇杆与按键，注入真实键盘事件操控 codex 终端。</p>
-              <p className="focus-warning">注入目标是当前聚焦窗口：使用时请保持 codex 终端在前台；音乐律动与控制器共用串口，二者同时只能运行一个。</p>
+              <p className="section-kicker">{MODE_LABELS[mode].kicker}</p>
+              <h2 id="controller-title">让板子<br /><em>{MODE_LABELS[mode].heading[1]}</em></h2>
+              <p className="hero-description">{MODE_LABELS[mode].description}</p>
+              <p className="focus-warning">{MODE_LABELS[mode].warning}</p>
               <div className="signal-readout" aria-live="polite">
                 <strong>{controllerSnapshot.injectedCount}</strong>
                 <span>次注入<br />本次运行</span>
@@ -383,7 +416,7 @@ function App() {
             </div>
           </section>
 
-          <section className="control-shell" aria-label="Codex 控制器设置">
+          <section className="control-shell" aria-label={`${MODE_LABELS[mode].title}设置`}>
             <div className="control-section connection-section">
               <div className="section-heading">
                 <span className="step-number">01</span>
@@ -416,7 +449,7 @@ function App() {
                 <div><p className="section-kicker">KEY MAPPING</p><h3>按键映射</h3></div>
               </div>
               <div className="key-grid">
-                {KEY_MAPPINGS.map((mapping) => (
+                {(mode === "media" ? MEDIA_KEY_MAPPINGS : KEY_MAPPINGS).map((mapping) => (
                   <div key={mapping.board} className="key-row">
                     <span className="key-board">{mapping.board}</span>
                     <span className="key-inject">{mapping.inject}</span>

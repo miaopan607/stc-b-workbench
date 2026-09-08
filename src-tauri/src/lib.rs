@@ -6,7 +6,9 @@ mod serial;
 mod service;
 
 use controller::ControllerService;
-use models::{ControllerSnapshot, ReactiveConfig, RuntimeSnapshot, SerialPortDescriptor};
+use models::{
+    ControllerProfile, ControllerSnapshot, ReactiveConfig, RuntimeSnapshot, SerialPortDescriptor,
+};
 use service::ReactiveService;
 
 use tauri::{AppHandle, Manager, State};
@@ -44,10 +46,11 @@ fn start_controller(
     reactive: State<'_, ReactiveService>,
     controller: State<'_, ControllerService>,
     port_name: String,
+    profile: ControllerProfile,
 ) -> Result<(), String> {
     // 串口独占：启动控制器前先停掉音乐律动
     reactive.stop()?;
-    controller.start(&app, &port_name)
+    controller.start(&app, &port_name, profile)
 }
 
 #[tauri::command]

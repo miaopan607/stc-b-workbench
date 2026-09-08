@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
-use crate::models::{ControllerPhase, ControllerSnapshot};
+use crate::models::{ControllerPhase, ControllerProfile, ControllerSnapshot};
 use crate::serial;
 
 const FRAME_HEAD: [u8; 2] = [0xAA, 0x5A];
@@ -26,6 +26,11 @@ const KEY_CENTER: u8 = 5;
 const KEY_K1: u8 = 6;
 const KEY_K2: u8 = 7;
 const KEY_K3: u8 = 8;
+
+// Win32 媒体键 VK 值（该 windows-sys 版本未导出这些常量）
+const VK_MEDIA_PREV_TRACK: u16 = 0xB1;
+const VK_MEDIA_NEXT_TRACK: u16 = 0xB2;
+const VK_MEDIA_PLAY_PAUSE: u16 = 0xB3;
 
 // ---------------------------------------------------------------------------
 // 按键注入（Windows SendInput）
@@ -80,6 +85,14 @@ mod inject {
         ])
     }
 
+    // 媒体键没有 set-1 扫描码，按扩展键以 VK 投递（对应硬件 E0 前缀序列）
+    pub fn tap_vk(vk: u16) -> bool {
+        send(&[
+            key_event(vk, 0, KEYEVENTF_EXTENDEDKEY),
+            key_event(vk, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
+        ])
+    }
+
     pub fn ctrl_c() -> bool {
         const LCTRL_SCAN: u16 = 0x1D;
         const C_SCAN: u16 = 0x2E;
@@ -115,23 +128,42 @@ fn action_label(action: u8) -> &'static str {
     }
 }
 
-fn inject_key(key: u8) -> Option<(&'static str, fn() -> bool)> {
-    match key {
-        KEY_UP => Some(("↑", || inject::tap(0x48, true))),
-        KEY_DOWN => Some(("↓", || inject::tap(0x50, true))),
-        KEY_LEFT => Some(("Backspace", || inject::tap(0x0E, false))),
-        KEY_RIGHT => Some(("/", || inject::tap_char('/'))),
-        KEY_CENTER => Some(("Enter", || inject::tap(0x1C, false))),
-        KEY_K1 => Some(("Ctrl+C", inject::ctrl_c)),
-        KEY_K2 => Some(("Tab", || inject::tap(0x0F, false))),
-        KEY_K3 => Some(("Esc", || inject::tap(0x01, false))),
-        _ => None,
+fn inject_key(key: u8, profile: ControllerProfile) -> Option<(&'static str, fn() -> bool)> {
+    match profile {
+        ControllerProfile::Codex => match key {
+            KEY_UP => Some(("↑", || inject::tap(0x48, true))),
+            KEY_DOWN => Some(("↓", || inject::tap(0x50, true))),
+            KEY_LEFT => Some(("Backspace", || inject::tap(0x0E, false))),
+            KEY_RIGHT => Some(("/", || inject::tap_char('/'))),
+            KEY_CENTER => Some(("Enter", || inject::tap(0x1C, false))),
+            KEY_K1 => Some(("Ctrl+C", inject::ctrl_c)),
+            KEY_K2 => Some(("Tab", || inject::tap(0x0F, false))),
+            KEY_K3 => Some(("Esc", || inject::tap(0x01, false))),
+            _ => None,
+        },
+        ControllerProfile::Media => match key {
+            KEY_K1 => Some(("下一曲", || inject::tap_vk(VK_MEDIA_NEXT_TRACK))),
+            KEY_K2 => Some(("播放/暂停", || inject::tap_vk(VK_MEDIA_PLAY_PAUSE))),
+            KEY_K3 => Some(("上一曲", || inject::tap_vk(VK_MEDIA_PREV_TRACK))),
+            _ => None,
+        },
     }
 }
 
 // ---------------------------------------------------------------------------
 // 帧解析
 // ---------------------------------------------------------------------------
+
+/// 音乐律动运行时复用：解析板子发来的按键数据，K1/K2/K3 注入系统媒体键，其余键忽略
+pub fn feed_media_keys(parser: &mut KeyFrameParser, data: &[u8]) {
+    for event in parser.feed(data) {
+        if event.action != ACT_RELEASE {
+            if let Some((_, fire)) = inject_key(event.key, ControllerProfile::Media) {
+                fire();
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyEvent {
@@ -267,20 +299,20 @@ impl ControllerService {
         }
     }
 
-    pub fn start(&self, app: &AppHandle, port_name: &str) -> Result<(), String> {
+    pub fn start(&self, app: &AppHandle, port_name: &str, profile: ControllerProfile) -> Result<(), String> {
         let mut runtime = self
             .runtime
             .lock()
             .map_err(|_| "运行状态锁已损坏".to_owned())?;
         if runtime.is_some() {
-            return Err("Codex 控制器已经在运行".to_owned());
+            return Err("控制器已经在运行".to_owned());
         }
         if port_name.trim().is_empty() {
             return Err("未选择串口".to_owned());
         }
         let shared = Arc::new(ControllerShared {
             cancel: Arc::new(AtomicBool::new(false)),
-            snapshot: Mutex::new(ControllerSnapshot::starting(port_name)),
+            snapshot: Mutex::new(ControllerSnapshot::starting(port_name, profile)),
         });
         shared.update(app, |snapshot| {
             snapshot.phase = ControllerPhase::Starting;
@@ -292,7 +324,7 @@ impl ControllerService {
         let thread_port = port_name.to_owned();
         let thread = thread::Builder::new()
             .name("stc-controller-reader".to_owned())
-            .spawn(move || reader_loop(thread_app, thread_shared, thread_port))
+            .spawn(move || reader_loop(thread_app, thread_shared, thread_port, profile))
             .map_err(|error| error.to_string())?;
         *runtime = Some(ControllerRuntimeHandle { shared, thread });
         Ok(())
@@ -334,7 +366,7 @@ impl Default for ControllerService {
     }
 }
 
-fn reader_loop(app: AppHandle, shared: Arc<ControllerShared>, port_name: String) {
+fn reader_loop(app: AppHandle, shared: Arc<ControllerShared>, port_name: String, profile: ControllerProfile) {
     let mut parser;
     while !shared.cancel.load(Ordering::Acquire) {
         match serial::open_port(&port_name) {
@@ -342,9 +374,10 @@ fn reader_loop(app: AppHandle, shared: Arc<ControllerShared>, port_name: String)
                 parser = KeyFrameParser::new();
                 shared.update(&app, |snapshot| {
                     snapshot.phase = ControllerPhase::Running;
+                    snapshot.port_name = Some(port_name.to_owned());
                     snapshot.message = format!("已连接 {port_name}，等待板子按键…");
                 });
-                read_loop(&app, &shared, &mut port, &mut parser);
+                read_loop(&app, &shared, &mut port, &mut parser, profile);
             }
             Err(error) => {
                 shared.update(&app, |snapshot| {
@@ -362,6 +395,7 @@ fn read_loop(
     shared: &Arc<ControllerShared>,
     port: &mut Box<dyn serialport::SerialPort>,
     parser: &mut KeyFrameParser,
+    profile: ControllerProfile,
 ) {
     let mut buf = [0u8; 128];
     while !shared.cancel.load(Ordering::Acquire) {
@@ -370,7 +404,7 @@ fn read_loop(
             Ok(n) => {
                 let bad_frames = parser.bad_frames();
                 for event in parser.feed(&buf[..n]) {
-                    dispatch_key(app, shared, event, bad_frames);
+                    dispatch_key(app, shared, event, bad_frames, profile);
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
@@ -389,6 +423,7 @@ fn dispatch_key(
     shared: &Arc<ControllerShared>,
     event: KeyEvent,
     bad_frames: u32,
+    profile: ControllerProfile,
 ) {
     let board = key_label(event.key);
     let action = action_label(event.action);
@@ -396,7 +431,7 @@ fn dispatch_key(
     let (injected, ok) = if event.action == ACT_RELEASE {
         (None, true)
     } else {
-        match inject_key(event.key) {
+        match inject_key(event.key, profile) {
             Some((label, fire)) => {
                 let ok = fire();
                 (Some(label), ok)

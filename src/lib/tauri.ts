@@ -38,6 +38,7 @@ export const subscribeReactiveState = (onState: (state: RuntimeSnapshot) => void
 
 export interface ControllerSnapshot {
   phase: ControllerPhase;
+  profile: ControllerProfile;
   portName: string | null;
   injectedCount: number;
   badFrames: number;
@@ -54,8 +55,10 @@ export interface ControllerKeyEvent {
 }
 
 export type ControllerPhase = "idle" | "starting" | "running";
+export type ControllerProfile = "codex" | "media";
 
-export const startController = (portName: string) => invoke<void>("start_controller", { portName });
+export const startController = (portName: string, profile: ControllerProfile) =>
+  invoke<void>("start_controller", { portName, profile });
 export const stopController = () => invoke<void>("stop_controller");
 export const getControllerState = () => invoke<ControllerSnapshot>("get_controller_state");
 

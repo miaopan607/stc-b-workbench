@@ -203,12 +203,23 @@ fn sender_loop(
     source: crate::models::AudioSource,
 ) {
     shared.set_running(source);
+    // 发送间隙轮询板子按键帧：K1/K2/K3 注入媒体键（读超时调短以免拖慢发送节奏）
+    let _ = port.set_timeout(Duration::from_millis(2));
+    let mut parser = crate::controller::KeyFrameParser::new();
     let mut sequence = 0_u8;
     let mut next_send = Instant::now();
     let mut fps_window = Instant::now();
     let mut successful_writes = 0_u16;
 
     while !shared.cancel.load(Ordering::Acquire) {
+        let mut rx = [0u8; 64];
+        loop {
+            match port.read(&mut rx) {
+                Ok(0) => break,
+                Ok(n) => crate::controller::feed_media_keys(&mut parser, &rx[..n]),
+                Err(_) => break,
+            }
+        }
         let bars = shared.bars.load(Ordering::Acquire).min(8);
         if let Err(error) = serial::write_bars(&mut *port, sequence, bars) {
             shared.set_error(Some(source), format!("串口发送失败：{error}"));
