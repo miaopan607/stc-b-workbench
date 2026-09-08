@@ -19,6 +19,10 @@
 // 显示 run+第8位转圈动画（工作中）或 Stop（空闲），8 颗 LED 上 3 颗连灯
 // 常亮并连续往复扫描。动画在板上本地运行，PC 只发状态变化。
 //
+// 提醒音：任务完成（agent_end 非续跑且非手动中断）或需手动操作
+// （tool_approval_requested 审批、ask 工具提问）时发送 [AA 5A 23 0 tune chk]，
+// 板载蜂鸣器播放 C4-E4-G4-C5 上行琶音（每音 250ms）。手动中断（K1/Esc）不提醒。
+//
 // 命令: /board          断开/连接（多串口时弹出选择）
 //       /board COM5     连接指定串口
 //
@@ -33,6 +37,7 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 const FRAME_TYPE_KEY = 0x21;
 const FRAME_TYPE_STATUS = 0x22;
+const FRAME_TYPE_TUNE = 0x23;
 const FRAME_LEN = 6;
 const ACT_PRESS = 1;
 const ACT_REPEAT = 2;
@@ -61,6 +66,13 @@ const KEY_SEQUENCES: Record<number, string> = {
 // 状态帧布局与音乐帧一致：字节3为保留0，字节4为负载（固件按 [3]==0 && [4]<=1 校验）
 export function statusFrame(status: number): Uint8Array {
 	return Uint8Array.from([0xaa, 0x5a, FRAME_TYPE_STATUS, 0, status, FRAME_TYPE_STATUS ^ status]);
+}
+
+// 提醒音帧：字节3保留0，字节4为曲调号（固件按 [3]==0 && [4]==tune 校验）
+// TUNE_REMIND = C4-E4-G4-C5 上行琶音，任务完成/需手动操作时播放
+export const TUNE_REMIND = 1;
+export function tuneFrame(tune: number): Uint8Array {
+	return Uint8Array.from([0xaa, 0x5a, FRAME_TYPE_TUNE, 0, tune, FRAME_TYPE_TUNE ^ tune]);
 }
 
 class KeyFrameParser {
@@ -266,6 +278,18 @@ export default function stcBoard(pi: ExtensionAPI) {
 		}
 	}
 
+	// --- 提醒音（[AA 5A 23 0 tune chk]）---
+
+	function sendTune(tune: number) {
+		if (!port) return;
+		const frame = tuneFrame(tune);
+		try {
+			loadKernel32().symbols.WriteFile(port.handle, ptr(frame), frame.length, ptr(port.txCount), null);
+		} catch {
+			// 写失败不致命
+		}
+	}
+
 	// --- 按键处理 ---
 
 	function handleKey(key: number, action: number) {
@@ -367,10 +391,32 @@ export default function stcBoard(pi: ExtensionAPI) {
 
 	pi.on("agent_end", (event) => {
 		// willContinue：自动续跑（重试等）马上会再次 agent_start，保持工作中显示
-		if (!(event as { willContinue?: boolean }).willContinue) {
-			working = false;
-			sendStatus();
+		const e = event as { willContinue?: boolean; messages?: Array<{ role?: string; stopReason?: string }> };
+		if (e.willContinue) return;
+		// 手动中断（K1/Esc）时最后一条助手消息 stopReason=aborted：
+		// 显示要切回 Stop，但不播提醒音（用户自己按的，无需提示）
+		const last = e.messages?.[e.messages.length - 1];
+		const aborted = last?.role === "assistant" && last.stopReason === "aborted";
+		working = false;
+		sendStatus();
+		if (!aborted) {
+			// BSP 串口为单缓冲，两个数据包之间需 ≥1ms 间隔，否则后一帧被丢弃。
+			// 状态帧刚发出，提醒音帧延迟 12ms 再发，确保不撞帧。
+			sessionCtx?.setTimeout(() => sendTune(TUNE_REMIND), 12);
 		}
+	});
+
+	// agent 用 ask 工具向用户提问：工具执行开始后即阻塞等待回答，
+	// 此时不会触发 agent_end，需单独提醒（审批弹窗由 tool_approval_requested 覆盖）
+	pi.on("tool_execution_start", (event) => {
+		if ((event as { toolName?: string }).toolName === "ask") {
+			sendTune(TUNE_REMIND);
+		}
+	});
+
+	// 工具需用户批准（手动操作）时提醒
+	pi.on("tool_approval_requested", () => {
+		sendTune(TUNE_REMIND);
 	});
 
 	// --- 生命周期 ---

@@ -3,13 +3,17 @@
 import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
 
 const factory = (await import("./stc-board.ts")).default as ExtensionFactory;
-const { statusFrame } = (await import("./stc-board.ts")) as { statusFrame: (status: number) => Uint8Array };
+const { statusFrame, tuneFrame, TUNE_REMIND } = (await import("./stc-board.ts")) as { statusFrame: (status: number) => Uint8Array; tuneFrame: (tune: number) => Uint8Array; TUNE_REMIND: number };
 
 // 状态帧布局：字节3=保留0，字节4=状态，字节5=chk(0x22^status)
 const runningFrame = statusFrame(1);
 const stoppedFrame = statusFrame(0);
 check("状态帧 running 布局", runningFrame[0] === 0xaa && runningFrame[1] === 0x5a && runningFrame[2] === 0x22 && runningFrame[3] === 0 && runningFrame[4] === 1 && runningFrame[5] === 0x23, Array.from(runningFrame).join(" "));
 check("状态帧 stop 布局", stoppedFrame[4] === 0 && stoppedFrame[5] === 0x22, Array.from(stoppedFrame).join(" "));
+
+// 提醒音帧布局：字节3=保留0，字节4=tune，字节5=chk(0x23^tune)
+const remindFrame = tuneFrame(TUNE_REMIND);
+check("提醒音帧布局", remindFrame[0] === 0xaa && remindFrame[1] === 0x5a && remindFrame[2] === 0x23 && remindFrame[3] === 0 && remindFrame[4] === TUNE_REMIND && remindFrame[5] === (0x23 ^ TUNE_REMIND), Array.from(remindFrame).join(" "));
 
 let failures = 0;
 function check(name: string, ok: boolean, detail = "") {
@@ -67,6 +71,12 @@ const ctxMock = {
 		timers.push(timer);
 		return timer;
 	},
+	setTimeout(fn: () => void) {
+		// 一次性、即发即弃（真实运行时 12ms 后触发，关闭时由 ctx 自动清理）
+		// 不计入 timers，避免污染轮询定时器的清理断言
+		fn();
+		return { fn, cleared: true };
+	},
 	clearTimer(timer: { cleared: boolean }) {
 		timer.cleared = true;
 	},
@@ -79,12 +89,19 @@ await handlers.session_start({}, ctxMock);
 check("session_start 注册了轮询定时器", timers.length === 1);
 check("widget 已注册", widgetComponent !== null);
 check("agent_start/agent_end 已注册", Boolean(handlers.agent_start && handlers.agent_end));
+check("tool_approval_requested / tool_execution_start 已注册", Boolean(handlers.tool_approval_requested && handlers.tool_execution_start));
 
 // 工作状态事件（无串口时只更新内部状态，不应崩溃）
 await handlers.agent_start({}, ctxMock);
 await handlers.agent_end({ willContinue: true }, ctxMock);
 await handlers.agent_end({}, ctxMock);
-check("agent 状态事件不崩溃（无串口）", true);
+// 手动中断：最后一条助手消息 stopReason=aborted → 只发状态帧，不播提醒音
+await handlers.agent_end({ messages: [{ role: "assistant", stopReason: "aborted" }] }, ctxMock);
+// ask 工具提问 → 提醒音
+await handlers.tool_execution_start!({ toolName: "ask" }, ctxMock);
+await handlers.tool_execution_start!({ toolName: "bash" }, ctxMock);
+await handlers.tool_approval_requested!({}, ctxMock);
+check("agent 状态/提醒事件不崩溃（无串口）", true);
 const rendered = widgetComponent!.render(120);
 check("widget 零行渲染（不占额外行）", rendered.length === 0, `行数=${rendered.length}`);
 const chip = statusCalls.at(-1)?.[1] ?? "";
