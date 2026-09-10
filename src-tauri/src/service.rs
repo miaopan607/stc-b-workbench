@@ -15,15 +15,21 @@ const STATE_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) struct SharedRuntime {
     pub cancel: Arc<AtomicBool>,
     pub bars: Arc<AtomicU8>,
+    pub bars_left: Arc<AtomicU8>,
+    pub bars_right: Arc<AtomicU8>,
     snapshot: Mutex<RuntimeSnapshot>,
 }
 
 impl SharedRuntime {
     fn new(config: &ReactiveConfig) -> Self {
+        let mut snapshot = RuntimeSnapshot::starting(config.audio_source);
+        snapshot.stereo = config.stereo;
         Self {
             cancel: Arc::new(AtomicBool::new(false)),
             bars: Arc::new(AtomicU8::new(0)),
-            snapshot: Mutex::new(RuntimeSnapshot::starting(config.audio_source)),
+            bars_left: Arc::new(AtomicU8::new(0)),
+            bars_right: Arc::new(AtomicU8::new(0)),
+            snapshot: Mutex::new(snapshot),
         }
     }
 
@@ -37,15 +43,20 @@ impl SharedRuntime {
     fn set_running(&self, source: crate::models::AudioSource) {
         if let Ok(mut snapshot) = self.snapshot.lock() {
             if snapshot.phase == RuntimePhase::Starting {
+                let stereo = snapshot.stereo;
                 *snapshot = RuntimeSnapshot::running(source);
+                snapshot.stereo = stereo;
             }
         }
     }
 
     fn set_signal(&self, level: audio::StereoLevel, bars: u8) {
+        let (left, right) = audio::level_to_bars_stereo(level);
         self.bars.store(bars.min(8), Ordering::Release);
+        self.bars_left.store(left, Ordering::Release);
+        self.bars_right.store(right, Ordering::Release);
         if let Ok(mut snapshot) = self.snapshot.lock() {
-            snapshot.set_signal(level.left.max(level.right), bars);
+            snapshot.set_signal(level.left.max(level.right), bars, left, right);
         }
     }
 
@@ -100,10 +111,11 @@ impl ReactiveService {
         let port = serial::open_port(&config.port_name)?;
         let shared = Arc::new(SharedRuntime::new(&config));
         let source = config.audio_source;
+        let stereo = config.stereo;
         let sender_shared = shared.clone();
         let sender = thread::Builder::new()
             .name("stc-serial-sender".to_owned())
-            .spawn(move || sender_loop(port, sender_shared, source))
+            .spawn(move || sender_loop(port, sender_shared, source, stereo))
             .map_err(|error| error.to_string())?;
 
         let audio_shared = shared.clone();
@@ -201,6 +213,7 @@ fn sender_loop(
     mut port: Box<dyn serialport::SerialPort>,
     shared: Arc<SharedRuntime>,
     source: crate::models::AudioSource,
+    stereo: bool,
 ) {
     shared.set_running(source);
     // 发送间隙轮询板子按键帧：K1/K2/K3 注入媒体键（读超时调短以免拖慢发送节奏）
@@ -220,8 +233,15 @@ fn sender_loop(
                 Err(_) => break,
             }
         }
-        let bars = shared.bars.load(Ordering::Acquire).min(8);
-        if let Err(error) = serial::write_bars(&mut *port, sequence, bars) {
+        let write_result = if stereo {
+            let left = shared.bars_left.load(Ordering::Acquire).min(8);
+            let right = shared.bars_right.load(Ordering::Acquire).min(8);
+            serial::write_stereo_bars(&mut *port, left, right)
+        } else {
+            let bars = shared.bars.load(Ordering::Acquire).min(8);
+            serial::write_bars(&mut *port, sequence, bars)
+        };
+        if let Err(error) = write_result {
             shared.set_error(Some(source), format!("串口发送失败：{error}"));
             return;
         }
@@ -241,7 +261,12 @@ fn sender_loop(
         }
     }
 
-    let _ = serial::write_bars(&mut *port, sequence, 0);
+    let stop_result = if stereo {
+        serial::write_stereo_bars(&mut *port, 0, 0)
+    } else {
+        serial::write_bars(&mut *port, sequence, 0)
+    };
+    let _ = stop_result;
 }
 
 fn publish_loop(app: AppHandle, shared: Arc<SharedRuntime>) {

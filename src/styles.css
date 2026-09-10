@@ -104,6 +104,9 @@ button, select { font: inherit; }
 .seven-segment.active { opacity: 1; transform: scale(1); filter: drop-shadow(0 0 7px var(--display-on)) drop-shadow(0 0 16px var(--display-shadow)); }
 .segment { fill: #46615e; transition: fill 120ms ease; }
 .active .segment { fill: var(--display-on); }
+.seven-segment.half-top, .seven-segment.half-bottom { opacity: 1; transform: scale(1); filter: drop-shadow(0 0 7px var(--display-on)) drop-shadow(0 0 16px var(--display-shadow)); }
+.seven-segment.half-top .segment.a, .seven-segment.half-top .segment.b, .seven-segment.half-top .segment.f, .seven-segment.half-top .segment.g { fill: var(--display-on); }
+.seven-segment.half-bottom .segment.c, .seven-segment.half-bottom .segment.d, .seven-segment.half-bottom .segment.e { fill: var(--display-on); }
 .stage-caption { position: relative; justify-content: space-between; color: var(--md-sys-color-secondary); font: 11px 'DM Mono', monospace; letter-spacing: .04em; }
 .live-line { display: flex; align-items: center; gap: 8px; }
 .live-line i { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--md-sys-color-primary); }

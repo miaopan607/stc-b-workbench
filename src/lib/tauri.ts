@@ -17,13 +17,17 @@ export interface ReactiveConfig {
   sensitivity: number;
   punch: number;
   ambientLimit: number;
+  stereo: boolean;
 }
 
 export interface RuntimeSnapshot {
   phase: RuntimePhase;
   source: AudioSource | null;
+  stereo: boolean;
   level: number;
   barCount: number;
+  barCountLeft: number;
+  barCountRight: number;
   sentFps: number;
   message: string;
 }

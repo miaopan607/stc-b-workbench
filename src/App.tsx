@@ -55,8 +55,11 @@ interface KeyLogEntry {
 const DEFAULT_SNAPSHOT: RuntimeSnapshot = {
   phase: "idle",
   source: null,
+  stereo: false,
   level: 0,
   barCount: 0,
+  barCountLeft: 0,
+  barCountRight: 0,
   sentFps: 0,
   message: "音乐律动未启动",
 };
@@ -116,6 +119,7 @@ function App() {
   const [portName, setPortName] = useState("");
   const [audioSource, setAudioSource] = useState<AudioSource>("systemLoopback");
   const [detectionMode, setDetectionMode] = useState<DetectionMode>("lowFrequency");
+  const [stereo, setStereo] = useState(false);
   const [sensitivity, setSensitivity] = useState(115);
   const [punch, setPunch] = useState(125);
   const [ambientLimit, setAmbientLimit] = useState(10);
@@ -276,6 +280,7 @@ function App() {
           sensitivity,
           punch,
           ambientLimit,
+          stereo,
         };
         await startReactive(config);
       }
@@ -480,16 +485,27 @@ function App() {
               <h2 id="preview-title">让节拍<br /><em>看得见</em></h2>
               <p className="hero-description">实时捕捉系统声音或麦克风输入，将音量转换成板载数码管的连续律动。律动同时，板载 K1/K2/K3 可直接控制上一曲 / 播放暂停 / 下一曲。</p>
               <div className="signal-readout" aria-live="polite">
-                <strong>{snapshot.barCount}</strong>
-                <span>/ 8 格<br />实时音量</span>
+                <strong>{snapshot.stereo ? `${snapshot.barCountLeft}|${snapshot.barCountRight}` : snapshot.barCount}</strong>
+                <span>{snapshot.stereo ? <>左/右声道<br />格数</> : <>/ 8 格<br />实时音量</>}</span>
               </div>
             </div>
             <div className="display-stage">
               <div className="display-glow" aria-hidden="true" />
-              <div className="segment-display" role="img" aria-label={`当前点亮 ${snapshot.barCount} 格，共 8 格`}>
-                {Array.from({ length: 8 }, (_, index) => (
-                  <SevenSegment key={index} active={index < snapshot.barCount} />
-                ))}
+              <div className="segment-display" role="img" aria-label={snapshot.stereo ? `左声道 ${snapshot.barCountLeft} 格，右声道 ${snapshot.barCountRight} 格` : `当前点亮 ${snapshot.barCount} 格，共 8 格`}>
+                {Array.from({ length: 8 }, (_, index) => {
+                  if (snapshot.stereo) {
+                    const top = index < snapshot.barCountLeft;
+                    const bottom = index < snapshot.barCountRight;
+                    return (
+                      <SevenSegment
+                        key={index}
+                        active={top && bottom}
+                        half={top && !bottom ? "top" : bottom && !top ? "bottom" : null}
+                      />
+                    );
+                  }
+                  return <SevenSegment key={index} active={index < snapshot.barCount} />;
+                })}
               </div>
               <div className="stage-caption">
                 <span className="live-line"><i /> {snapshot.source ? SOURCE_LABELS[snapshot.source] : "等待输入"}</span>
@@ -544,6 +560,14 @@ function App() {
                   </md-filter-chip>
                   <md-filter-chip selected={detectionMode === "beatEnhanced"} disabled={isRunning} onClick={() => setDetectionMode("beatEnhanced")}>
                     节拍增强
+                  </md-filter-chip>
+                </div>
+                <div className="chip-group" role="group" aria-label="声道模式">
+                  <md-filter-chip selected={!stereo} disabled={isRunning} onClick={() => setStereo(false)}>
+                    单声道
+                  </md-filter-chip>
+                  <md-filter-chip selected={stereo} disabled={isRunning} onClick={() => setStereo(true)}>
+                    双声道（上半左/下半右）
                   </md-filter-chip>
                 </div>
               </div>
@@ -831,9 +855,14 @@ function App() {
   );
 }
 
-function SevenSegment({ active }: { active: boolean }) {
+function SevenSegment({ active, half }: { active: boolean; half?: "top" | "bottom" | null }) {
+  const className = active
+    ? "seven-segment active"
+    : half
+      ? `seven-segment half-${half}`
+      : "seven-segment";
   return (
-    <svg className={active ? "seven-segment active" : "seven-segment"} viewBox="0 0 52 94" aria-hidden="true">
+    <svg className={className} viewBox="0 0 52 94" aria-hidden="true">
       <path className="segment a" d="M12 4h28l5 5-5 5H12L7 9z" />
       <path className="segment b" d="M43 13l5 5v25l-5 5-5-5V18z" />
       <path className="segment c" d="M43 51l5 5v25l-5 5-5-5V56z" />

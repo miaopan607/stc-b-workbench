@@ -10,13 +10,21 @@ pub struct StereoLevel {
     pub right: f32,
 }
 
-pub fn level_to_bars(level: StereoLevel) -> u8 {
-    let level = level.left.max(level.right).clamp(0.0, 1.0);
+pub fn level_to_bars_value(level: f32) -> u8 {
+    let level = level.clamp(0.0, 1.0);
     if level == 0.0 {
         0
     } else {
         (level * 8.0).ceil().clamp(1.0, 8.0) as u8
     }
+}
+
+pub fn level_to_bars(level: StereoLevel) -> u8 {
+    level_to_bars_value(level.left.max(level.right))
+}
+
+pub fn level_to_bars_stereo(level: StereoLevel) -> (u8, u8) {
+    (level_to_bars_value(level.left), level_to_bars_value(level.right))
 }
 
 pub struct Analyzer {
@@ -668,6 +676,7 @@ mod tests {
             sensitivity: 115,
             punch: 125,
             ambient_limit: 10,
+            stereo: false,
         }
     }
 
@@ -722,5 +731,18 @@ mod tests {
         assert_eq!(level_to_bars(StereoLevel { left: 0.01, right: 0.0 }), 1);
         assert_eq!(level_to_bars(StereoLevel { left: 0.25, right: 0.5 }), 4);
         assert_eq!(level_to_bars(StereoLevel { left: 1.0, right: 0.0 }), 8);
+    }
+
+    #[test]
+    fn stereo_bars_map_each_channel_independently() {
+        assert_eq!(level_to_bars_stereo(StereoLevel::default()), (0, 0));
+        assert_eq!(
+            level_to_bars_stereo(StereoLevel { left: 0.25, right: 0.5 }),
+            (2, 4)
+        );
+        assert_eq!(
+            level_to_bars_stereo(StereoLevel { left: 1.0, right: 0.0 }),
+            (8, 0)
+        );
     }
 }

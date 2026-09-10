@@ -3,7 +3,7 @@ use std::time::Duration;
 use serialport::{DataBits, FlowControl, Parity, SerialPort, SerialPortType, StopBits};
 
 use crate::models::SerialPortDescriptor;
-use crate::protocol::{build_bar_frame, FRAME_LENGTH};
+use crate::protocol::{build_bar_frame, build_stereo_bar_frame, FRAME_LENGTH};
 
 pub fn list_ports() -> Result<Vec<SerialPortDescriptor>, String> {
     let ports = serialport::available_ports().map_err(|error| error.to_string())?;
@@ -54,6 +54,16 @@ pub fn write_bars(
     bars: u8,
 ) -> Result<(), String> {
     let frame = build_bar_frame(sequence, bars).map_err(|error| error.to_string())?;
+    port.write_all(&frame[..FRAME_LENGTH])
+        .map_err(|error| error.to_string())
+}
+
+pub fn write_stereo_bars(
+    port: &mut dyn SerialPort,
+    left: u8,
+    right: u8,
+) -> Result<(), String> {
+    let frame = build_stereo_bar_frame(left, right).map_err(|error| error.to_string())?;
     port.write_all(&frame[..FRAME_LENGTH])
         .map_err(|error| error.to_string())
 }

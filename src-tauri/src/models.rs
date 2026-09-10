@@ -51,6 +51,8 @@ pub struct ReactiveConfig {
     pub sensitivity: u8,
     pub punch: u8,
     pub ambient_limit: u8,
+    /// 双声道模式：数码管每位上半段显示左声道、下半段显示右声道
+    pub stereo: bool,
 }
 
 impl ReactiveConfig {
@@ -62,6 +64,7 @@ impl ReactiveConfig {
             sensitivity: self.sensitivity.clamp(50, 200),
             punch: self.punch.min(200),
             ambient_limit: self.ambient_limit.min(40),
+            stereo: self.stereo,
         }
     }
 }
@@ -71,8 +74,11 @@ impl ReactiveConfig {
 pub struct RuntimeSnapshot {
     pub phase: RuntimePhase,
     pub source: Option<AudioSource>,
+    pub stereo: bool,
     pub level: f32,
     pub bar_count: u8,
+    pub bar_count_left: u8,
+    pub bar_count_right: u8,
     pub sent_fps: u8,
     pub message: String,
 }
@@ -82,8 +88,11 @@ impl RuntimeSnapshot {
         Self {
             phase: RuntimePhase::Idle,
             source: None,
+            stereo: false,
             level: 0.0,
             bar_count: 0,
+            bar_count_left: 0,
+            bar_count_right: 0,
             sent_fps: 0,
             message: "音乐律动未启动".to_owned(),
         }
@@ -93,8 +102,11 @@ impl RuntimeSnapshot {
         Self {
             phase: RuntimePhase::Starting,
             source: Some(source),
+            stereo: false,
             level: 0.0,
             bar_count: 0,
+            bar_count_left: 0,
+            bar_count_right: 0,
             sent_fps: 0,
             message: "正在连接设备与音频来源".to_owned(),
         }
@@ -104,8 +116,11 @@ impl RuntimeSnapshot {
         Self {
             phase: RuntimePhase::Running,
             source: Some(source),
+            stereo: false,
             level: 0.0,
             bar_count: 0,
+            bar_count_left: 0,
+            bar_count_right: 0,
             sent_fps: 0,
             message: "运行中".to_owned(),
         }
@@ -115,16 +130,21 @@ impl RuntimeSnapshot {
         Self {
             phase: RuntimePhase::Error,
             source,
+            stereo: false,
             level: 0.0,
             bar_count: 0,
+            bar_count_left: 0,
+            bar_count_right: 0,
             sent_fps: 0,
             message: message.into(),
         }
     }
 
-    pub fn set_signal(&mut self, level: f32, bar_count: u8) {
+    pub fn set_signal(&mut self, level: f32, bar_count: u8, bar_count_left: u8, bar_count_right: u8) {
         self.level = level.clamp(0.0, 1.0);
         self.bar_count = bar_count.min(8);
+        self.bar_count_left = bar_count_left.min(8);
+        self.bar_count_right = bar_count_right.min(8);
     }
 }
 
