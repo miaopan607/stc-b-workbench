@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import "@material/web/button/filled-button.js";
 import "@material/web/button/outlined-button.js";
 import "@material/web/chips/filter-chip.js";
@@ -10,6 +11,8 @@ import {
   getControllerState,
   getReactiveState,
   listSerialPorts,
+  safekeyBegin,
+  safekeyEnd,
   startController,
   startReactive,
   stopController,
@@ -17,6 +20,14 @@ import {
   subscribeControllerKey,
   subscribeControllerState,
   subscribeReactiveState,
+  subscribeSafeKeyEvent,
+  vaultCreate,
+  vaultLock,
+  vaultOpenDir,
+  vaultRelock,
+  vaultState,
+  vaultUnlock,
+  vaultVerify,
   type AudioSource,
   type ControllerKeyEvent,
   type ControllerPhase,
@@ -26,11 +37,13 @@ import {
   type ReactiveConfig,
   type RuntimePhase,
   type RuntimeSnapshot,
+  type SafeKeyEvent,
   type SerialPortDescriptor,
 } from "./lib/tauri";
 import "./styles.css";
 
-type AppMode = "music" | "controller" | "media";
+type AppMode = "music" | "controller" | "media" | "vault";
+type VaultAuthStatus = "idle" | "waiting" | "ok" | "fail" | "locked";
 
 interface KeyLogEntry {
   id: number;
@@ -78,7 +91,7 @@ const MEDIA_KEY_MAPPINGS: { board: string; inject: string; usage: string }[] = [
   { board: "K3", inject: "上一曲", usage: "系统媒体键：切换到上一首" },
 ];
 
-const MODE_LABELS: Record<Exclude<AppMode, "music">, { title: string; kicker: string; heading: [string, string]; description: string; warning: string }> = {
+const MODE_LABELS: Record<Exclude<AppMode, "music" | "vault">, { title: string; kicker: string; heading: [string, string]; description: string; warning: string }> = {
   controller: {
     title: "Codex 控制器",
     kicker: "PHYSICAL CONTROLLER / CODEX CLI",
@@ -109,6 +122,14 @@ function App() {
   const [isDark, setIsDark] = useState(false);
   const [notice, setNotice] = useState("");
   const [keyLog, setKeyLog] = useState<KeyLogEntry[]>([]);
+  const [authStatus, setAuthStatus] = useState<VaultAuthStatus>("idle");
+  const [authDetail, setAuthDetail] = useState("");
+  const [vaultPath, setVaultPath] = useState("");
+  const [vaultInfoText, setVaultInfoText] = useState("");
+  const [outputRoot, setOutputRoot] = useState("D:\\SafeKey-Unlocked");
+  const [autolockSecs, setAutolockSecs] = useState(300);
+  const [vaultUnlocked, setVaultUnlocked] = useState(false);
+  const [remaining, setRemaining] = useState(0);
   const logIdRef = useRef(0);
 
   const isRunning = snapshot.phase === "running" || snapshot.phase === "starting";
@@ -123,6 +144,7 @@ function App() {
     let unlistenState: (() => void) | undefined;
     let unlistenController: (() => void) | undefined;
     let unlistenKey: (() => void) | undefined;
+    let unlistenSafeKey: (() => void) | undefined;
     let active = true;
 
     void getReactiveState()
@@ -147,6 +169,10 @@ function App() {
       .finally(() => {
         void subscribeControllerState((state) => {
           if (active) setControllerSnapshot(state);
+          // 板子断开/串口被音乐律动抢占：立即锁定保险箱（未解锁时为无害空操作）
+          if (state.phase === "idle") {
+            void vaultLock().catch(() => undefined);
+          }
         }).then((cleanup) => {
           if (active) unlistenController = cleanup;
           else cleanup();
@@ -157,6 +183,12 @@ function App() {
           if (active) unlistenKey = cleanup;
           else cleanup();
         });
+        void subscribeSafeKeyEvent((event) => {
+          if (active) handleSafeKeyEvent(event);
+        }).then((cleanup) => {
+          if (active) unlistenSafeKey = cleanup;
+          else cleanup();
+        });
       });
 
     void refreshPorts();
@@ -165,8 +197,48 @@ function App() {
       unlistenState?.();
       unlistenController?.();
       unlistenKey?.();
+      unlistenSafeKey?.();
     };
   }, []);
+
+  // 保险箱 tab 可见时轮询解锁状态与倒计时
+  useEffect(() => {
+    if (mode !== "vault") return;
+    let active = true;
+    const poll = () =>
+      vaultState()
+        .then((state) => {
+          if (active) {
+            setVaultUnlocked(state.unlocked);
+            setRemaining(state.remainingSecs);
+          }
+        })
+        .catch(() => undefined);
+    poll();
+    const timer = window.setInterval(poll, 1000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [mode]);
+
+  function handleSafeKeyEvent(event: SafeKeyEvent) {
+    if (event.event === 1) {
+      setAuthStatus("ok");
+      setAuthDetail("认证成功，可选择保险箱并解锁");
+    } else if (event.event === 2) {
+      setAuthStatus("fail");
+      setAuthDetail(`认证失败（第 ${event.payload} 次），还剩 ${3 - event.payload} 次机会`);
+    } else if (event.event === 3) {
+      setAuthStatus("locked");
+      setAuthDetail(`失败次数过多，板子锁定 ${event.payload} 秒`);
+    } else if (event.event === 5) {
+      setAuthStatus("idle");
+      setAuthDetail("");
+    } else if (event.event === 4) {
+      setAuthDetail(`板上已确认 ${event.payload}/6 位，K3 可回退`);
+    }
+  }
 
   function appendKeyLog(event: ControllerKeyEvent) {
     const id = ++logIdRef.current;
@@ -214,17 +286,127 @@ function App() {
 
   async function toggleController() {
     setNotice("");
-    const profile: ControllerProfile = mode === "media" ? "media" : "codex";
+    const profile: ControllerProfile =
+      mode === "media" ? "media" : mode === "vault" ? "vault" : "codex";
     try {
       if (controllerRunning) {
         await stopController();
         setControllerSnapshot(DEFAULT_CONTROLLER_SNAPSHOT);
         setKeyLog([]);
+        setAuthStatus("idle");
+        setAuthDetail("");
       } else {
         await startController(portName, profile);
       }
     } catch (error) {
       setNotice(formatError(error, "无法启动控制器"));
+    }
+  }
+
+  async function beginAuth() {
+    setNotice("");
+    try {
+      await safekeyBegin();
+      setAuthStatus("waiting");
+      setAuthDetail("请在板上输入 6 位 PIN：K1 数字+1，K2 确认下一位，K3 回退");
+    } catch (error) {
+      setNotice(formatError(error, "无法开始 PIN 验证"));
+    }
+  }
+
+  async function endAuth() {
+    try {
+      await safekeyEnd();
+    } catch {
+      // 忽略：板子可能已断开
+    }
+    setAuthStatus("idle");
+    setAuthDetail("");
+  }
+
+  async function refreshVaultInfo(path: string) {
+    try {
+      const info = await vaultVerify(path);
+      const name = path.split(/[\\/]/).pop();
+      setVaultInfoText(`${name} · ${info.entries} 个文件 · 解密载荷 ${(info.payloadSize / 1024).toFixed(1)} KB`);
+    } catch {
+      setVaultInfoText("无法验证所选保险箱文件");
+    }
+  }
+
+  async function pickVault() {
+    setNotice("");
+    const selected = await open({
+      multiple: false,
+      filters: [{ name: "保险箱文件", extensions: ["safevault"] }],
+    });
+    if (typeof selected === "string") {
+      setVaultPath(selected);
+      await refreshVaultInfo(selected);
+    }
+  }
+
+  async function createVault() {
+    setNotice("");
+    const source = await open({ directory: true, title: "选择需要加密的文件夹" });
+    if (typeof source !== "string") return;
+    const dest = await save({
+      title: "保存保险箱",
+      defaultPath: "新建保险箱.safevault",
+      filters: [{ name: "保险箱文件", extensions: ["safevault"] }],
+    });
+    if (typeof dest !== "string") return;
+    const deleteSource = await ask(
+      "创建成功后是否删除原文件夹中的明文？\n建议先解锁验证保险箱可用后再删除，此操作不可恢复。",
+      { title: "删除原文件夹", kind: "warning" },
+    );
+    try {
+      await vaultCreate(source, dest, deleteSource);
+      setVaultPath(dest);
+      await refreshVaultInfo(dest);
+    } catch (error) {
+      setNotice(formatError(error, "创建保险箱失败"));
+    }
+  }
+
+  async function unlockVault() {
+    setNotice("");
+    if (authStatus !== "ok") {
+      setNotice("请先在板上完成 PIN 认证");
+      return;
+    }
+    if (!vaultPath) {
+      setNotice("请先选择保险箱文件");
+      return;
+    }
+    try {
+      const dir = await vaultUnlock(vaultPath, outputRoot.trim(), autolockSecs);
+      setVaultUnlocked(true);
+      setAuthDetail(`已解锁到临时目录：${dir}`);
+    } catch (error) {
+      setNotice(formatError(error, "解锁失败"));
+    }
+  }
+
+  async function relockVault() {
+    setNotice("");
+    try {
+      await vaultRelock();
+      setVaultUnlocked(false);
+      setAuthDetail("修改已重新加密保存，临时目录已清理");
+    } catch (error) {
+      setNotice(formatError(error, "保存失败"));
+    }
+  }
+
+  async function lockVault() {
+    setNotice("");
+    try {
+      await vaultLock();
+      setVaultUnlocked(false);
+      setAuthDetail("保险箱已锁定，临时明文目录已清理");
+    } catch (error) {
+      setNotice(formatError(error, "锁定失败"));
     }
   }
 
@@ -235,7 +417,13 @@ function App() {
           <span className="brand-mark" aria-hidden="true">STC</span>
           <div>
             <p className="eyebrow">STC-B / USB AUDIO LINK</p>
-            <h1>{mode === "music" ? "音乐律动" : MODE_LABELS[mode].title}</h1>
+            <h1>
+              {mode === "music"
+                ? "音乐律动"
+                : mode === "vault"
+                  ? "文件保险箱"
+                  : MODE_LABELS[mode].title}
+            </h1>
           </div>
         </div>
         <div className="topbar-actions">
@@ -260,6 +448,13 @@ function App() {
               onClick={() => setMode("media")}
             >
               媒体控制
+            </button>
+            <button
+              type="button"
+              className={mode === "vault" ? "mode-tab active" : "mode-tab"}
+              onClick={() => setMode("vault")}
+            >
+              文件保险箱
             </button>
           </nav>
           <span className={`status-badge ${activeSnapshot.phase}`} aria-live="polite">
@@ -379,6 +574,144 @@ function App() {
               <md-filled-button disabled={!portName || isBusy} onClick={() => void toggleReactive()}>
                 {isRunning ? "停止律动" : "开始律动"}
               </md-filled-button>
+            </div>
+          </div>
+        </main>
+      ) : mode === "vault" ? (
+        <main className="content">
+          <section className="hero-grid" aria-labelledby="vault-title">
+            <div className="preview-copy">
+              <p className="section-kicker">HARDWARE AUTH / LOCAL VAULT</p>
+              <h2 id="vault-title">板子就是<br /><em>钥匙</em></h2>
+              <p className="hero-description">
+                在板上输入 PIN 完成硬件认证后，才能把 AES-256-GCM 加密的保险箱解密到临时目录；
+                板子断开、超时或手动锁定都会立即清理明文。
+              </p>
+              <p className="focus-warning">
+                板上操作：K1 当前数字 +1，K2 确认进入下一位，K3 回退一位。默认 PIN 123456（修改需重新编译固件）。
+              </p>
+              <div className="signal-readout" aria-live="polite">
+                <strong>{vaultUnlocked ? remaining : "—"}</strong>
+                <span>
+                  {vaultUnlocked ? "秒后自动锁定" : "自动锁定"}
+                  <br />
+                  {vaultUnlocked ? "保险箱已解锁" : "保险箱未解锁"}
+                </span>
+              </div>
+            </div>
+            <div className="display-stage">
+              <div className="display-glow" aria-hidden="true" />
+              <div className="key-log-panel" aria-live="polite" aria-label="认证状态">
+                <p className={authStatus === "ok" || authStatus === "idle" ? "key-log-line" : "key-log-line fail"}>
+                  {authLabel(authStatus)}
+                </p>
+                {authDetail && <p className="key-log-line">{authDetail}</p>}
+              </div>
+              <div className="stage-caption">
+                <span className="live-line"><i /> {controllerSnapshot.portName ?? "未连接"}</span>
+                <span className="fps-line">PIN 模式下 K1/K2/K3 由板子接管</span>
+              </div>
+            </div>
+          </section>
+
+          <section className="control-shell" aria-label="文件保险箱设置">
+            <div className="control-section connection-section">
+              <div className="section-heading">
+                <span className="step-number">01</span>
+                <div><p className="section-kicker">HARDWARE</p><h3>连接设备</h3></div>
+              </div>
+              <div className="connection-row">
+                <md-outlined-select
+                  label="USB 虚拟串口"
+                  value={portName}
+                  disabled={controllerRunning}
+                  onChange={(event) => setPortName((event.target as HTMLSelectElement).value)}
+                >
+                  {ports.map((port) => (
+                    <md-select-option key={port.name} value={port.name}>
+                      <span slot="headline">{port.name}</span>
+                      <span slot="supporting-text">{port.friendlyName}</span>
+                    </md-select-option>
+                  ))}
+                </md-outlined-select>
+                <md-outlined-button disabled={controllerRunning} onClick={() => void refreshPorts()}>
+                  刷新
+                </md-outlined-button>
+                {controllerRunning ? (
+                  <md-filled-button onClick={() => void toggleController()}>断开连接</md-filled-button>
+                ) : (
+                  <md-filled-button disabled={!portName || controllerBusy} onClick={() => void toggleController()}>
+                    启动连接
+                  </md-filled-button>
+                )}
+              </div>
+              <p className="section-note">认证链路与 Codex 控制器共用：此模式下板载按键不会注入键盘。</p>
+            </div>
+
+            <div className="control-section mapping-section">
+              <div className="section-heading">
+                <span className="step-number">02</span>
+                <div><p className="section-kicker">PIN AUTH</p><h3>硬件认证</h3></div>
+              </div>
+              <div className="connection-row">
+                <md-filled-button disabled={!controllerRunning || authStatus === "locked"} onClick={() => void beginAuth()}>
+                  开始 PIN 验证
+                </md-filled-button>
+                <md-outlined-button disabled={!controllerRunning || authStatus === "idle"} onClick={() => void endAuth()}>
+                  结束验证
+                </md-outlined-button>
+              </div>
+              <p className="section-note">错 3 次板子锁定 30 秒；认证成功后解锁按钮才可用。</p>
+            </div>
+
+            <div className="control-section parameters-section">
+              <div className="section-heading">
+                <span className="step-number">03</span>
+                <div><p className="section-kicker">VAULT</p><h3>保险箱文件</h3></div>
+              </div>
+              <div className="connection-row">
+                <md-outlined-button onClick={() => void pickVault()}>选择保险箱</md-outlined-button>
+                <md-outlined-button onClick={() => void createVault()}>从文件夹创建</md-outlined-button>
+              </div>
+              <p className="section-note">{vaultPath ? vaultPath : "尚未选择保险箱文件"}</p>
+              <p className="section-note">{vaultInfoText}</p>
+              <div className="sliders">
+                <label className="parameter">
+                  <span className="parameter-label">解锁目录<strong style={{ fontSize: "0.85em" }}>{outputRoot || "—"}</strong></span>
+                  <input
+                    className="vault-path-input"
+                    value={outputRoot}
+                    disabled={vaultUnlocked}
+                    onChange={(event) => setOutputRoot(event.target.value)}
+                  />
+                </label>
+                <ParameterSlider label="自动锁定" value={autolockSecs} min={10} max={3600} unit="秒" disabled={vaultUnlocked} onValue={setAutolockSecs} />
+              </div>
+            </div>
+          </section>
+
+          <div className="bottom-bar">
+            <div className="runtime-meta">
+              <md-linear-progress value={vaultUnlocked ? Math.min(remaining, autolockSecs) : 0} max={autolockSecs} aria-label="自动锁定倒计时" />
+              <span>{vaultUnlocked ? `已解锁 · ${remaining} 秒后自动锁定` : "保险箱已锁定"}</span>
+            </div>
+            <div className="action-area">
+              <p className={notice ? "error-message" : "runtime-message"} role={notice ? "alert" : undefined} aria-live="polite">
+                {notice || controllerSnapshot.message}
+              </p>
+              <div className="vault-actions">
+                {vaultUnlocked ? (
+                  <>
+                    <md-outlined-button onClick={() => void vaultOpenDir()}>打开临时目录</md-outlined-button>
+                    <md-outlined-button onClick={() => void lockVault()}>放弃修改并锁定</md-outlined-button>
+                    <md-filled-button onClick={() => void relockVault()}>保存修改并锁定</md-filled-button>
+                  </>
+                ) : (
+                  <md-filled-button disabled={!controllerRunning || authStatus !== "ok" || !vaultPath} onClick={() => void unlockVault()}>
+                    解锁保险箱
+                  </md-filled-button>
+                )}
+              </div>
             </div>
           </div>
         </main>
@@ -550,6 +883,16 @@ function phaseLabel(phase: RuntimePhase) {
 
 function controllerPhaseLabel(phase: ControllerPhase) {
   return { idle: "待命", starting: "启动中", running: "运行中" }[phase];
+}
+
+function authLabel(status: VaultAuthStatus) {
+  return {
+    idle: "未认证",
+    waiting: "等待 PIN 输入…",
+    ok: "已认证 ✓",
+    fail: "认证失败",
+    locked: "板子已锁定",
+  }[status];
 }
 
 function formatError(error: unknown, fallback: string) {

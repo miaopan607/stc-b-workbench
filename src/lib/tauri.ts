@@ -55,7 +55,7 @@ export interface ControllerKeyEvent {
 }
 
 export type ControllerPhase = "idle" | "starting" | "running";
-export type ControllerProfile = "codex" | "media";
+export type ControllerProfile = "codex" | "media" | "vault";
 
 export const startController = (portName: string, profile: ControllerProfile) =>
   invoke<void>("start_controller", { portName, profile });
@@ -67,3 +67,39 @@ export const subscribeControllerState = (onState: (state: ControllerSnapshot) =>
 
 export const subscribeControllerKey = (onKey: (event: ControllerKeyEvent) => void): Promise<UnlistenFn> =>
   listen<ControllerKeyEvent>("controller-key", (event) => onKey(event.payload));
+
+// ---------------------------------------------------------------------------
+// SafeKey 硬件认证 + 本地文件保险箱
+// ---------------------------------------------------------------------------
+
+export interface SafeKeyEvent {
+  event: number;
+  payload: number;
+}
+
+export interface VaultInfo {
+  entries: number;
+  payloadSize: number;
+}
+
+export interface VaultState {
+  unlocked: boolean;
+  vaultPath: string | null;
+  unlockedDir: string | null;
+  remainingSecs: number;
+}
+
+export const safekeyBegin = () => invoke<void>("safekey_begin");
+export const safekeyEnd = () => invoke<void>("safekey_end");
+export const vaultCreate = (source: string, dest: string, deleteSource: boolean) =>
+  invoke<void>("vault_create", { source, dest, deleteSource });
+export const vaultVerify = (path: string) => invoke<VaultInfo>("vault_verify", { path });
+export const vaultUnlock = (path: string, outputRoot: string, autolockSecs: number) =>
+  invoke<string>("vault_unlock", { path, outputRoot, autolockSecs });
+export const vaultRelock = () => invoke<void>("vault_relock");
+export const vaultLock = () => invoke<void>("vault_lock");
+export const vaultState = () => invoke<VaultState>("vault_state");
+export const vaultOpenDir = () => invoke<void>("vault_open_dir");
+
+export const subscribeSafeKeyEvent = (onEvent: (event: SafeKeyEvent) => void): Promise<UnlistenFn> =>
+  listen<SafeKeyEvent>("safekey-event", (event) => onEvent(event.payload));

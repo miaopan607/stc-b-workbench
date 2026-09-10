@@ -38,6 +38,8 @@ pub enum ControllerProfile {
     Codex,
     /// K1/K2/K3 注入系统媒体键（下一曲/播放暂停/上一曲）
     Media,
+    /// 保险箱硬件认证：按键由板子 PIN 模式自用，PC 侧不注入任何键
+    Vault,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

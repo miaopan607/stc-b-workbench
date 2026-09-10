@@ -23,6 +23,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serialport = "4.10"
 wasapi = "0.24"
+tauri-plugin-dialog = "2"
+aes-gcm = "0.10"
+pbkdf2 = "0.12"
+sha2 = "0.10"
+zip = "2"
+getrandom = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse"] }

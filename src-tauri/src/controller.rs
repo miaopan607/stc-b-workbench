@@ -147,6 +147,8 @@ fn inject_key(key: u8, profile: ControllerProfile) -> Option<(&'static str, fn()
             KEY_K3 => Some(("上一曲", || inject::tap_vk(VK_MEDIA_PREV_TRACK))),
             _ => None,
         },
+        // 保险箱方案：K1/K2/K3 由板子 PIN 模式自用，PC 侧不注入任何键
+        ControllerProfile::Vault => None,
     }
 }
 
@@ -227,6 +229,81 @@ impl Default for KeyFrameParser {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SafeKey 认证帧解析（0x25：AA 5A 25 ev payload chk）
+// ---------------------------------------------------------------------------
+
+pub const FRAME_TYPE_SKAUTH: u8 = 0x25;
+pub const FRAME_TYPE_SAFEKEY: u8 = 0x24;
+pub const SK_EV_OK: u8 = 1;
+pub const SK_EV_FAIL: u8 = 2;
+pub const SK_EV_LOCK: u8 = 3;
+pub const SK_EV_INPUT: u8 = 4;
+pub const SK_EV_EXIT: u8 = 5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SafeKeyEvent {
+    pub event: u8,
+    pub payload: u8,
+}
+
+pub struct SafeKeyScanner {
+    buf: Vec<u8>,
+}
+
+impl SafeKeyScanner {
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    pub fn feed(&mut self, data: &[u8]) -> Vec<SafeKeyEvent> {
+        self.buf.extend_from_slice(data);
+        let mut events = Vec::new();
+        loop {
+            match self.buf.windows(2).position(|w| w == FRAME_HEAD) {
+                None => {
+                    if self.buf.len() > 1 {
+                        let last = self.buf[self.buf.len() - 1];
+                        self.buf.clear();
+                        self.buf.push(last);
+                    }
+                    break;
+                }
+                Some(0) => {
+                    if self.buf.len() < FRAME_LENGTH {
+                        break;
+                    }
+                    let frame: Vec<u8> = self.buf.drain(..FRAME_LENGTH).collect();
+                    let (event, payload) = (frame[3], frame[4]);
+                    if frame[2] == FRAME_TYPE_SKAUTH
+                        && (SK_EV_OK..=SK_EV_EXIT).contains(&event)
+                        && frame[5] == FRAME_TYPE_SKAUTH ^ event ^ payload
+                    {
+                        events.push(SafeKeyEvent { event, payload });
+                    }
+                }
+                Some(position) => {
+                    self.buf.drain(..position);
+                }
+            }
+        }
+        events
+    }
+}
+
+impl Default for SafeKeyScanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 主机→板子的 SafeKey 模式帧：AA 5A 24 0 cmd chk（cmd 1=进入 PIN 模式 0=退出）
+pub fn safekey_mode_frame(enter: bool) -> Vec<u8> {
+    let cmd = if enter { 1 } else { 0 };
+    vec![0xAA, 0x5A, FRAME_TYPE_SAFEKEY, 0, cmd, FRAME_TYPE_SAFEKEY ^ cmd]
+}
+
 fn parse_frame(frame: &[u8]) -> Option<KeyEvent> {
     if frame.len() != FRAME_LENGTH || frame[0..2] != FRAME_HEAD {
         return None;
@@ -260,6 +337,8 @@ pub struct ControllerKeyEvent {
 struct ControllerShared {
     cancel: Arc<AtomicBool>,
     snapshot: Mutex<ControllerSnapshot>,
+    /// 待发往板子的字节（SafeKey 模式帧等），由读取线程每轮冲刷
+    tx_outbox: Mutex<Vec<u8>>,
 }
 
 impl ControllerShared {
@@ -313,6 +392,7 @@ impl ControllerService {
         let shared = Arc::new(ControllerShared {
             cancel: Arc::new(AtomicBool::new(false)),
             snapshot: Mutex::new(ControllerSnapshot::starting(port_name, profile)),
+            tx_outbox: Mutex::new(Vec::new()),
         });
         shared.update(app, |snapshot| {
             snapshot.phase = ControllerPhase::Starting;
@@ -358,6 +438,24 @@ impl ControllerService {
             .and_then(|runtime| runtime.as_ref().map(|handle| handle.shared.snapshot()))
             .unwrap_or_else(ControllerSnapshot::idle)
     }
+
+    /// 请求板子进入/退出 SafeKey PIN 模式；字节由读取线程冲刷到串口
+    pub fn send_safekey(&self, enter: bool) -> Result<(), String> {
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| "运行状态锁已损坏".to_owned())?;
+        let Some(handle) = runtime.as_ref() else {
+            return Err("控制器未运行".to_owned());
+        };
+        handle
+            .shared
+            .tx_outbox
+            .lock()
+            .map_err(|_| "发送队列锁已损坏".to_owned())?
+            .extend_from_slice(&safekey_mode_frame(enter));
+        Ok(())
+    }
 }
 
 impl Default for ControllerService {
@@ -368,16 +466,18 @@ impl Default for ControllerService {
 
 fn reader_loop(app: AppHandle, shared: Arc<ControllerShared>, port_name: String, profile: ControllerProfile) {
     let mut parser;
+    let mut sk_scanner = SafeKeyScanner::new();
     while !shared.cancel.load(Ordering::Acquire) {
         match serial::open_port(&port_name) {
             Ok(mut port) => {
                 parser = KeyFrameParser::new();
+                sk_scanner = SafeKeyScanner::new();
                 shared.update(&app, |snapshot| {
                     snapshot.phase = ControllerPhase::Running;
                     snapshot.port_name = Some(port_name.to_owned());
                     snapshot.message = format!("已连接 {port_name}，等待板子按键…");
                 });
-                read_loop(&app, &shared, &mut port, &mut parser, profile);
+                read_loop(&app, &shared, &mut port, &mut parser, &mut sk_scanner, profile);
             }
             Err(error) => {
                 shared.update(&app, |snapshot| {
@@ -395,16 +495,38 @@ fn read_loop(
     shared: &Arc<ControllerShared>,
     port: &mut Box<dyn serialport::SerialPort>,
     parser: &mut KeyFrameParser,
+    sk_scanner: &mut SafeKeyScanner,
     profile: ControllerProfile,
 ) {
     let mut buf = [0u8; 128];
     while !shared.cancel.load(Ordering::Acquire) {
+        // 冲刷待发帧（SafeKey 模式等）
+        let outgoing = shared
+            .tx_outbox
+            .lock()
+            .map(|mut outbox| std::mem::take(&mut *outbox))
+            .unwrap_or_default();
+        if !outgoing.is_empty() && port.write_all(&outgoing).is_err() {
+            shared.update(app, |snapshot| {
+                snapshot.message = "串口发送失败，3 秒后重连".to_owned();
+            });
+            return;
+        }
         match port.read(&mut buf) {
             Ok(0) => continue,
             Ok(n) => {
                 let bad_frames = parser.bad_frames();
                 for event in parser.feed(&buf[..n]) {
                     dispatch_key(app, shared, event, bad_frames, profile);
+                }
+                for event in sk_scanner.feed(&buf[..n]) {
+                    let _ = app.emit(
+                        "safekey-event",
+                        SafeKeyEvent {
+                            event: event.event,
+                            payload: event.payload,
+                        },
+                    );
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
@@ -569,5 +691,57 @@ mod tests {
         assert!(parse_frame(&frame(KEY_UP, 0)).is_none());
         assert!(parse_frame(&frame(KEY_UP, ACT_RELEASE + 1)).is_none());
         assert!(parse_frame(&[0xAA, 0x5A, 0x21, KEY_UP, ACT_PRESS]).is_none());
+    }
+
+    fn sk_frame(event: u8, payload: u8) -> Vec<u8> {
+        vec![
+            FRAME_HEAD[0],
+            FRAME_HEAD[1],
+            FRAME_TYPE_SKAUTH,
+            event,
+            payload,
+            FRAME_TYPE_SKAUTH ^ event ^ payload,
+        ]
+    }
+
+    #[test]
+    fn safekey_scanner_parses_events_and_rejects_bad_frames() {
+        let mut scanner = SafeKeyScanner::new();
+        // 成功、失败、锁定一次到位
+        let events = scanner.feed(
+            &sk_frame(SK_EV_OK, 0)
+                .iter()
+                .chain(sk_frame(SK_EV_FAIL, 1).iter())
+                .chain(sk_frame(SK_EV_LOCK, 30).iter())
+                .copied()
+                .collect::<Vec<u8>>(),
+        );
+        assert_eq!(
+            events,
+            vec![
+                SafeKeyEvent { event: SK_EV_OK, payload: 0 },
+                SafeKeyEvent { event: SK_EV_FAIL, payload: 1 },
+                SafeKeyEvent { event: SK_EV_LOCK, payload: 30 },
+            ]
+        );
+        // 坏校验和被丢弃
+        let mut bad = sk_frame(SK_EV_OK, 0);
+        bad[5] ^= 0xFF;
+        assert!(scanner.feed(&bad).is_empty());
+        // 未知事件号被丢弃
+        assert!(scanner.feed(&sk_frame(9, 0)).is_empty());
+        // 跨包分片
+        let mut scanner2 = SafeKeyScanner::new();
+        let stream = sk_frame(SK_EV_INPUT, 3);
+        assert!(scanner2.feed(&stream[..4]).is_empty());
+        assert_eq!(
+            scanner2.feed(&stream[4..]),
+            vec![SafeKeyEvent { event: SK_EV_INPUT, payload: 3 }]
+        );
+        // 按键帧不应被误判
+        let mut scanner3 = SafeKeyScanner::new();
+        assert!(scanner3
+            .feed(&frame(KEY_UP, ACT_PRESS))
+            .is_empty());
     }
 }
